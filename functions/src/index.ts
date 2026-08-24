@@ -9,6 +9,7 @@
 // allUsers to each new callable after its first deploy (gen-2 service names are lowercase).
 
 import { onRequest } from "firebase-functions/v2/https";
+import { setGlobalOptions } from "firebase-functions/v2";
 import * as admin from "firebase-admin";
 import {
   makeGetInstructorSession,
@@ -26,8 +27,20 @@ import {
 } from "@mygames/game-server";
 import { matcherGameDef } from "./gameDefinition";
 import { ACTIVE_TENANT } from "./tenants";
+import { PROVISION_SECRET } from "./handoff";
 
 admin.initializeApp();
+
+// ⚠ BIND THE PROVISIONING SECRET TO EVERY FUNCTION.
+//
+// The hand-off (startAllGroups → provisionGroupToTenant) calls PROVISION_SECRET.value() at
+// runtime, but it is built from a SHARED factory (makeStartAllGroups) whose onCall options
+// carry no secrets — so without this the secret is never bound to startAllGroups and
+// .value() comes back empty in production, sending `Authorization: Bearer ` and getting the
+// hand-off rejected. A per-function `secrets:[...]` isn't reachable through the shared
+// factory, so it is set GLOBALLY here. Functions that declare their own secrets (syncRoster,
+// getRoster → the roster callback secret) override this for themselves and are unaffected.
+setGlobalOptions({ secrets: [PROVISION_SECRET] });
 
 // ── session, roster, matching, config ──────────────────────────────────────────
 export const getInstructorSession = makeGetInstructorSession(matcherGameDef);
