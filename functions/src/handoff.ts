@@ -43,10 +43,15 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
   for (const pid of seats) {
     if (bots.has(pid)) continue; // matcher-bot → guest game bot-fills instead
     const p = (await partCol.doc(pid).get()).data() ?? {};
-    members.push({
-      studentId: pid,
-      displayName: typeof p["display_name"] === "string" ? (p["display_name"] as string) : pid,
-    });
+    // ⚠ `display_name` is only set once a participant has been through online grouping;
+    // syncRoster (and in-class matching) writes the roster `name`, not `display_name`. Reading
+    // display_name ALONE fell back to the raw pid, so students showed up in the Beer Game as
+    // "dNkRCOmr1BlvOzTuxxuR". Fall back name-first, exactly like the shared displayNameOf.
+    const displayName =
+      (typeof p["display_name"] === "string" && p["display_name"].trim()) ? (p["display_name"] as string) :
+      (typeof p["name"] === "string" && (p["name"] as string).trim()) ? (p["name"] as string) :
+      pid;
+    members.push({ studentId: pid, displayName });
   }
   if (members.length === 0) return;
 
@@ -63,13 +68,15 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
       ? (process.env[t.handoff.secretName] ?? "emulator-secret")
       : PROVISION_SECRET.value();
 
+  const config = await buildGuestConfig(iid);
+
   const res = await fetch(provisionUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${secret}`,
     },
-    body: JSON.stringify({ instanceId: iid, groups: [{ groupId, members }] }),
+    body: JSON.stringify({ instanceId: iid, groups: [{ groupId, members }], config }),
   });
   if (!(res.status >= 200 && res.status < 300)) {
     throw new Error(`hand-off failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
@@ -92,6 +99,32 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
     },
     { merge: true },
   );
+}
+
+/**
+ * Translate the matcher instance's stored settings into the GUEST game's config shape,
+ * passed to provisionClassSession. Beer-Game-specific: the four friendly demand knobs
+ * (initial / final / step-week / weeks) become the `customerDemand` array + `nWeeks` the
+ * Beer Game expects (its sanitizeConfig requires customerDemand.length === nWeeks). Absent
+ * settings fall back to the Beer Game's own defaults (4→8 step at week 4, 40 weeks), so an
+ * instructor who changes nothing gets exactly the classic game.
+ */
+async function buildGuestConfig(iid: string): Promise<Record<string, unknown>> {
+  const snap = await db()
+    .collection("game_instances").doc(iid).collection("config").doc("main").get();
+  const c = (snap.data() ?? {}) as Record<string, unknown>;
+  const posInt = (key: string, fallback: number): number => {
+    const n = Math.round(Number(c[key]));
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+
+  const nWeeks = posInt("num_weeks", 40);
+  const initial = posInt("demand_initial", 4);
+  const final = posInt("demand_final", 8);
+  const stepWeek = Math.min(posInt("demand_step_week", 4), nWeeks);
+  const customerDemand = Array.from({ length: nWeeks }, (_, i) => (i < stepWeek ? initial : final));
+
+  return { nWeeks, customerDemand };
 }
 
 /** The student's deep link into the guest game's play, once their group is handed off. */

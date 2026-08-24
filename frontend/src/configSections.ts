@@ -13,6 +13,21 @@
 
 export const configSections = [
   {
+    // ⚠ THE BEER GAME'S SETTINGS, surfaced through the matcher. Every key here must also be
+    // in the tenant's guestConfigFields (functions/src/tenants.ts) AND is translated into the
+    // Beer Game's own config at hand-off (functions/src/handoff.ts buildGuestConfig). Customer
+    // demand is the classic step: a low level for the first few weeks, then a one-time jump —
+    // the shock that drives the bullwhip effect.
+    id: 'beergame',
+    title: 'Beer Game settings',
+    fields: [
+      { key: 'demand_initial',   label: 'Customer demand — starting level (units/week)', kind: 'positiveInt' as const, placeholder: '4' },
+      { key: 'demand_final',     label: 'Customer demand — after the step (units/week)',  kind: 'positiveInt' as const, placeholder: '8' },
+      { key: 'demand_step_week', label: 'Week the demand step happens',                   kind: 'positiveInt' as const, placeholder: '4' },
+      { key: 'num_weeks',        label: 'Number of weeks',                                kind: 'positiveInt' as const, placeholder: '40' },
+    ],
+  },
+  {
     id: 'contact',
     title: 'Instructor contact',
     fields: [

@@ -11,6 +11,8 @@
 // at hand-off (the Beer Game's provisionClassSession already does this) and bot-fills
 // short groups. So the matcher needs NO per-role machinery — just a group size + bots.
 
+import type { ConfigFieldDef } from "@mygames/game-server";
+
 export interface MatchingTenant {
   /** Registry game_id — what the classroom launches, carried in the launch JWT. */
   gameId: string;
@@ -44,6 +46,15 @@ export interface MatchingTenant {
   callbackSecretId: string;
   /** Secret (in the matcher's project) used to read the classroom roster via getCourseRoster. */
   rosterSecretName: string;
+
+  /**
+   * Instructor-editable settings for the GUEST GAME, surfaced through the matcher's Settings
+   * page and passed to the guest at hand-off. The matcher itself doesn't interpret them — it
+   * stores them on the instance config and the hand-off (see handoff.ts buildGuestConfig)
+   * translates them into the guest's own config shape. Each key must also appear in the
+   * frontend's configSections.ts.
+   */
+  guestConfigFields?: ConfigFieldDef[];
 }
 
 export const BEERGAME_TENANT: MatchingTenant = {
@@ -66,6 +77,16 @@ export const BEERGAME_TENANT: MatchingTenant = {
   },
   callbackSecretId: "beergame_v1",
   rosterSecretName: "CALLBACK_SECRET_BEERGAME",
+
+  // The Beer Game's instructor-tunable knobs. Customer demand is the classic step: a low
+  // level for the first few weeks, then a one-time jump (the shock that drives the bullwhip).
+  // handoff.ts turns these four into the guest's `customerDemand` array + `nWeeks`.
+  guestConfigFields: [
+    { key: "demand_initial", kind: "positiveInt", default: 4 },
+    { key: "demand_final", kind: "positiveInt", default: 8 },
+    { key: "demand_step_week", kind: "positiveInt", default: 4 },
+    { key: "num_weeks", kind: "positiveInt", default: 40 },
+  ],
 };
 
 /**

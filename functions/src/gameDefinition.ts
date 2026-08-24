@@ -61,9 +61,12 @@ export function defFrom(t: MatchingTenant): GameDefinition {
 
     // clock_mode = the in-class ('on') vs online ('off') toggle (per-instance).
     // instructor_email = the online "can't reach my group" mailto target.
+    // ...plus the guest game's own instructor-tunable settings (e.g. Beer Game customer
+    // demand), declared by the tenant and passed through at hand-off.
     configFields: [
       { key: "clock_mode", kind: "string", default: t.modes.online ? "off" : "on" },
       { key: "instructor_email", kind: "string", default: "" },
+      ...(t.guestConfigFields ?? []),
     ],
 
     // No knowledge check / prep in the matcher (the Beer Game's KC is deferred, and the

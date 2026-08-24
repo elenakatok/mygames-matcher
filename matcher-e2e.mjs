@@ -191,6 +191,11 @@ async function classroomFlow() {
   const gc = await genCode(gid);                const code = gc.ok ? gc.result.code : null
   check(!!code, `3. generateAttendanceCode — ${code ?? gc.error}`)
 
+  // Custom Beer Game demand settings — assert they flow through the hand-off as a
+  // customerDemand array (initial for weeks < step, final after) + nWeeks.
+  const cfg = await callFn('updateGameConfig', asDev(gid, { demand_initial: 5, demand_final: 12, demand_step_week: 3, num_weeks: 10 }))
+  check(cfg.ok, `3a. set demand config — ${cfg.ok ? 'ok' : cfg.error}`)
+
   // Only 4 of the 6 attend + are present — the other two stay in the No-Group pool.
   const present = ['stu1', 'stu2', 'stu3', 'stu4']
   let joinOk = true
@@ -212,6 +217,15 @@ async function classroomFlow() {
   const members = handoff?.groups?.[0]?.members ?? []
   check(members.length === 4, `8. hand-off carried 4 human members — got ${members.length}`)
   check(members.every((x) => x.studentId && x.displayName), `9. members carry studentId + displayName`)
+  // Names must be the ROSTER names, not the raw pid (the "dNkRCO…" bug).
+  const nameById = Object.fromEntries(ROSTER.map((r) => [r.participant_id, r.name]))
+  const namesOk = members.every((x) => x.displayName === nameById[x.studentId] && x.displayName !== x.studentId)
+  check(namesOk, `9a. member displayNames are real names, not pids — ${members.map((x) => x.displayName).join(', ')}`)
+  // Demand config translated correctly: 10 weeks, 5 for weeks 0-2, 12 from week 3.
+  const cfgOut = handoff?.config ?? {}
+  const expectedDemand = [5, 5, 5, 12, 12, 12, 12, 12, 12, 12]
+  check(cfgOut.nWeeks === 10 && JSON.stringify(cfgOut.customerDemand) === JSON.stringify(expectedDemand),
+    `9b. hand-off config = ${cfgOut.nWeeks} weeks, demand ${JSON.stringify(cfgOut.customerDemand)}`)
 
   // The group doc the student's HandoffRedirect reads now has the gameCode + lock.
   const roster = await getRoster(gid)
