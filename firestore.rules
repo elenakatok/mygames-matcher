@@ -46,37 +46,21 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // ⚠ THE ROUND-STATE COLLECTION IS DENIED BY NAME.
-    //
-    // It holds this round's `roundFields` — including every field the stage engine's
-    // reveal rule is deliberately withholding from some seat. A client that could read
-    // this document would see the hidden draw directly, and the callable payload would
-    // still be perfectly clean: the leak assertions on the wire would all pass while
-    // the game was completely broken.
-    //
-    // The default-deny at the bottom of this file would already cover it. The rule is
-    // written out anyway, because an explicit deny is auditable and survives someone
-    // later adding a permissive catch-all above it. The harness asserts THIS rule
-    // exists, not merely that the collection is unreachable today.
-    //
-    // ⚠ Keep this collection name in step with
-    // ROUND_COLLECTION in functions/src/infoshareRound.ts.
-    // ═════════════════════════════════════════════════════════════════════════
-    match /game_instances/{instanceId}/infoshare_round/{groupId} {
-      allow read, write: if false;
-    }
-    match /game_instances/{instanceId}/infoshare_round/{groupId}/{document=**} {
+    // Attendance code — the current in-class code. Server only: the student never reads
+    // it, they TYPE it and the verifyAttendanceCode callable checks it server-side.
+    match /game_instances/{instanceId}/attendance_code/{doc} {
       allow read, write: if false;
     }
 
-    // Groups. Written by Cloud Functions (the admin SDK bypasses rules); readable by
-    // any authenticated participant so the group reveal and the member list work.
+    // Groups. Written by Cloud Functions (the admin SDK bypasses rules); readable by any
+    // authenticated participant so the group reveal, the member list, and the hand-off
+    // redirect (which reads the group's `gameCode`) work.
     //
-    // ⚠ BEFORE YOU KEEP THIS AS-IS: does a group document hold anything one seat must
-    // not see? Membership, names and emails are shared by design. PRIVATE PER-SEAT
-    // STATE MUST NOT LIVE HERE — put it in the round-state collection above, which is
-    // denied, or narrow this rule to the requesting participant's own group.
+    // ⚠ THE MATCHER HAS NO PRIVATE PER-SEAT STATE. A group doc holds only membership,
+    // names, emails, and the guest-game `gameCode` — all shared by design (the gameCode
+    // is the shared Beer Game session code, not a per-seat secret). There is no round
+    // loop and no hidden-draw collection here (unlike a stage game). If that ever changes,
+    // private per-seat state must NOT live on the group doc.
     match /game_instances/{instanceId}/groups/{groupId} {
       allow read: if request.auth != null;
       allow write: if false;

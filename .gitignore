@@ -12,4 +12,6 @@ frontend/dist/
 
 # misc
 *-debug.log
+*.log
+e2e-logs/
 .DS_Store

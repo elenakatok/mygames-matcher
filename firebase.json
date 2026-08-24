@@ -9,5 +9,14 @@
     "rewrites": [{ "source": "**", "destination": "/index.html" }]
   },
   "firestore": { "rules": "firestore.rules", "indexes": "firestore.indexes.json" },
-  "database": { "rules": "database.rules.json" }
+  "database": { "rules": "database.rules.json" },
+  "emulators": {
+    "auth": { "port": 9101 },
+    "functions": { "port": 5005 },
+    "firestore": { "port": 8082 },
+    "database": { "port": 9002 },
+    "hosting": { "port": 5006 },
+    "ui": { "enabled": true, "port": 4002 },
+    "singleProjectMode": true
+  }
 }

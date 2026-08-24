@@ -7,6 +7,13 @@
 // stores that code on the group so each student can deep-link into the guest game's play.
 
 import * as admin from "firebase-admin";
+// ⚠ FieldValue from the MODULAR subpath, NOT `admin.firestore.FieldValue`. Under
+// firebase-admin ^12 the latter is `undefined` at runtime, so every hand-off write threw
+// `Cannot read properties of undefined (reading 'serverTimestamp')` — the group never got
+// its gameCode and no student was ever redirected. This is the same gotcha the Beer Game
+// hit; the rest of the matcher (online.ts, the shared seat factories) already imports it
+// this way.
+import { FieldValue } from "firebase-admin/firestore";
 import { defineSecret } from "firebase-functions/params";
 import { ACTIVE_TENANT } from "./tenants";
 
@@ -43,11 +50,24 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
   }
   if (members.length === 0) return;
 
-  const res = await fetch(t.handoff.provisionUrl, {
+  // ⚠ EMULATOR ONLY: let the e2e harness point the hand-off at a mock provisioning
+  // endpoint. Gated on FUNCTIONS_EMULATOR so a deployed matcher can NEVER be redirected
+  // away from the real guest game by a stray env var — production always uses the tenant's
+  // baked provisionUrl.
+  const provisionUrl =
+    process.env.FUNCTIONS_EMULATOR === "true" && process.env.PROVISION_URL_OVERRIDE
+      ? process.env.PROVISION_URL_OVERRIDE
+      : t.handoff.provisionUrl;
+  const secret =
+    process.env.FUNCTIONS_EMULATOR === "true"
+      ? (process.env[t.handoff.secretName] ?? "emulator-secret")
+      : PROVISION_SECRET.value();
+
+  const res = await fetch(provisionUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${PROVISION_SECRET.value()}`,
+      Authorization: `Bearer ${secret}`,
     },
     body: JSON.stringify({ instanceId: iid, groups: [{ groupId, members }] }),
   });
@@ -57,8 +77,19 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
   const out = (await res.json()) as { gameCode?: string };
   if (!out.gameCode) throw new Error("hand-off returned no gameCode");
 
+  // ⚠ `seats_locked_at` is what the STAGE ADAPTER reads for "this group has started"
+  // (groupDocAdapter.hasStarted → seats_locked_at != null). Setting it at hand-off is the
+  // matcher's equivalent of a stage game opening round 1: once a group is in the guest game
+  // its membership must freeze — re-group (instance-wide lock) and move/ungroup (per-group
+  // lock) both gate on this flag, so without it an instructor could re-form a group whose
+  // students are already playing the Beer Game, orphaning them. `gameCode` drives the
+  // student redirect and the "running" set; `seats_locked_at` drives the seat lock.
   await groupRef.set(
-    { gameCode: out.gameCode, handed_off_at: admin.firestore.FieldValue.serverTimestamp() },
+    {
+      gameCode: out.gameCode,
+      handed_off_at: FieldValue.serverTimestamp(),
+      seats_locked_at: FieldValue.serverTimestamp(),
+    },
     { merge: true },
   );
 }
