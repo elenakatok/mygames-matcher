@@ -1,0 +1,15 @@
+# dependencies + build output
+**/node_modules/
+functions/lib/
+frontend/dist/
+.firebase/
+
+# secrets + local env (never commit)
+**/.env
+**/.env.*
+!**/.env.example
+**/.secret.local
+
+# misc
+*-debug.log
+.DS_Store
