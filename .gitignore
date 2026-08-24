@@ -8,6 +8,9 @@ frontend/dist/
 **/.env
 **/.env.*
 !**/.env.example
+# ...except functions/.env, which holds only NON-secret classroom endpoint URLs and is
+# tracked like every other game's (secrets live in .secret.local / Secret Manager, not here).
+!functions/.env
 **/.secret.local
 
 # misc
