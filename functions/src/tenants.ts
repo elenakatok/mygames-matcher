@@ -36,6 +36,14 @@ export interface MatchingTenant {
     provisionUrl: string;
     /** Guest game "end session" endpoint (Beer Game: finalizeClassSession). */
     finalizeUrl: string;
+    /**
+     * Guest game "read per-team + per-player costs" endpoint (Beer Game: getClassResults).
+     * The matcher POSTs { gameCode } with the provisioning secret and gets back each team's
+     * total cost and each human player's individual cost. The matcher pools these across ALL
+     * of an instance's teams (which live in separate guest games) to compute a cross-team
+     * z-score and push the gradebook — because no single guest game can see the other teams.
+     */
+    resultsUrl: string;
     /** Name of the secret (in the matcher's project) holding the shared provisioning secret. */
     secretName: string;
     /** Student play URL; the matcher appends `?class=<gameCode>&sid=<participantId>`. */
@@ -72,6 +80,8 @@ export const BEERGAME_TENANT: MatchingTenant = {
       "https://us-central1-beergame-mygames-live.cloudfunctions.net/provisionClassSession",
     finalizeUrl:
       "https://us-central1-beergame-mygames-live.cloudfunctions.net/finalizeClassSession",
+    resultsUrl:
+      "https://us-central1-beergame-mygames-live.cloudfunctions.net/getClassResults",
     secretName: "PROVISION_SECRET_BEERGAME",
     playUrl: "https://beergame-mygames-live.web.app",
   },

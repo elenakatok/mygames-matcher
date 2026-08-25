@@ -75,8 +75,30 @@ const asDev     = (gid, extra = {}) => ({ _dev: { game_instance_id: gid }, ...ex
 let cbServer = null
 let provisionRequests = []   // every hand-off body the mock Beer Game received
 let finalizeRequests = []    // every gameCode the mock Beer Game was asked to finalize
+let gradePushes = []         // every gradebook row the MATCHER pushed to the mock classroom
+let membersByCode = {}       // gameCode → the human members provisioned into it (for mock results)
 let rosterRequests = 0
 let nextGameCode = 1
+
+// Mock guest-game results for a gameCode. Team cost is DETERMINISTIC from the code's numeric
+// suffix so distinct groups get distinct costs (→ non-zero std → a real z-score to assert).
+// Individual costs vary per seat so the Outcome column has distinguishable values.
+function mockResultsFor(code) {
+  const members = membersByCode[code] ?? []
+  const suffix = parseInt(String(code).replace(/\D/g, ''), 10) || 1
+  const teamCost = 1000 + suffix * 100
+  const roles = ['retailer', 'wholesaler', 'distributor', 'factory']
+  const players = members.map((m, i) => ({
+    studentId: m.studentId,
+    role: roles[i % 4],
+    teamId: 'team1',
+    teamName: `Mock Team ${suffix}`,
+    teamCost,
+    individualCost: Math.round(teamCost / 4) + i * 10,
+    participated: true,
+  }))
+  return { ok: true, gameCode: code, teams: [{ teamId: 'team1', teamName: `Mock Team ${suffix}`, teamCost }], players }
+}
 const ROSTER = [
   { participant_id: 'stu1', name: 'Ada Lovelace',    email: 'ada@example.edu',   external_id: 'stu1' },
   { participant_id: 'stu2', name: 'Alan Turing',     email: 'alan@example.edu',  external_id: 'stu2' },
@@ -94,15 +116,28 @@ function startClassroom() {
         let parsed = null
         try { parsed = JSON.parse(b) } catch { /* */ }
         r.writeHead(200, { 'Content-Type': 'application/json' })
-        // The mock BEER GAME: a hand-off carries `groups` — answer with a game code.
-        if (parsed && Array.isArray(parsed.groups)) {
+        const url = req.url || '/'
+        // The mock BEER GAME hand-off (/provision): a hand-off carries `groups` — answer with
+        // a game code and remember which humans went into it (so /results can echo their costs).
+        if (url.endsWith('/provision') || (url === '/' && parsed && Array.isArray(parsed.groups))) {
           provisionRequests.push(parsed)
           const code = `BEER${String(nextGameCode++).padStart(3, '0')}`
+          membersByCode[code] = parsed?.groups?.[0]?.members ?? []
           r.end(JSON.stringify({ gameCode: code })); return
         }
-        // A finalize carries `gameCode` and no groups — record it, ack ended.
-        if (parsed && typeof parsed.gameCode === 'string' && !parsed.groups) {
-          finalizeRequests.push(parsed.gameCode)
+        // /results — the matcher reads a session's team + player costs (Beer Game getClassResults).
+        if (url.endsWith('/results')) {
+          finalizeRequests // no-op ref to keep lints quiet
+          r.end(JSON.stringify(mockResultsFor(parsed?.gameCode))); return
+        }
+        // /finalize — end a session, ack ended.
+        if (url.endsWith('/finalize')) {
+          finalizeRequests.push(parsed?.gameCode)
+          r.end(JSON.stringify({ ok: true })); return
+        }
+        // /game-results — the MATCHER's gradebook push (one row per human student).
+        if (url.endsWith('/game-results')) {
+          gradePushes.push(parsed)
           r.end(JSON.stringify({ ok: true })); return
         }
         // Otherwise it is a roster pull.
@@ -127,9 +162,12 @@ async function bringUp() {
     ['emulators:start', '--only', 'auth,functions,firestore,database', '--project', PROJECT],
     { cwd: ROOT, detached: true, stdio: ['ignore', log, log],
       env: { ...process.env,
-             PROVISION_URL_OVERRIDE: CB,
-             FINALIZE_URL_OVERRIDE: CB,
-             PROVISION_SECRET_BEERGAME: PROVISION_SECRET } }))
+             PROVISION_URL_OVERRIDE: `${CB}/provision`,
+             FINALIZE_URL_OVERRIDE: `${CB}/finalize`,
+             RESULTS_URL_OVERRIDE: `${CB}/results`,
+             CALLBACK_URL_OVERRIDE: `${CB}/game-results`,
+             PROVISION_SECRET_BEERGAME: PROVISION_SECRET,
+             CALLBACK_SECRET_BEERGAME: 'test-callback-secret' } }))
   const start = Date.now()
   for (;;) {
     try { const r = await fetch(`${FUNCTIONS}/health`); if (r.ok) break } catch { /* */ }
@@ -246,12 +284,25 @@ async function classroomFlow() {
   const st2 = await startAll(gid);              check(st2.ok && st2.result.started === 0, `12. re-press Start is idempotent — started ${st2.result?.started ?? st2.error}`)
   check(provisionRequests.length === before + 1, `13. no duplicate hand-off on re-press`)
 
-  // Finalize & record — ends the handed-off guest session (grades everyone present),
-  // WITHOUT waiting for the game to finish, and is re-runnable.
+  // Finalize & record — ends the handed-off guest session, reads its costs, and pushes one
+  // gradebook row per HUMAN (raw_score = individual cost, normalized_score = team z), WITHOUT
+  // waiting for the game to finish. Re-runnable.
   finalizeRequests.length = 0
-  const sr = await scoreAndRecord(gid);         check(sr.ok && sr.result.scored === 1, `14. scoreAndRecord finalizes the handed-off group — scored ${sr.result?.scored ?? sr.error}`)
+  gradePushes = []
+  const sr = await scoreAndRecord(gid);         check(sr.ok && sr.result.scored === 4, `14. scoreAndRecord grades all 4 present players — scored ${sr.result?.scored ?? sr.error}`)
   check(finalizeRequests.length === 1 && finalizeRequests[0] === gdoc?.gameCode, `15. mock Beer Game got finalize for the gameCode — ${finalizeRequests.join(',')}`)
-  const sr2 = await scoreAndRecord(gid);        check(sr2.ok && sr2.result.scored === 1, `16. scoreAndRecord is re-runnable — scored ${sr2.result?.scored ?? sr2.error}`)
+  // Four grade rows pushed to the classroom, each carrying the individual cost as raw_score.
+  check(gradePushes.length === 4, `16. four gradebook rows pushed — ${gradePushes.length}`)
+  const allHaveCost = gradePushes.every((p) => typeof p.raw_score === 'number' && p.status === 'completed' && p.game_instance_id === gid)
+  check(allHaveCost, `17. every grade row carries raw_score (individual cost) + completed status`)
+  // Single team → std 0 → every z is 0 (documented behaviour when all teams cost the same).
+  check(gradePushes.every((p) => p.normalized_score === 0), `18. single-team cohort → z=0 for all (std 0)`)
+  // Outcome column: the matcher wrote raw_score onto its own participant docs.
+  const rosterAfter = await getRoster(gid)
+  const withOutcome = (rosterAfter.result?.participants ?? []).filter((p) => typeof p.raw_score === 'number')
+  check(withOutcome.length === 4, `19. dashboard Outcome (raw_score) set on 4 participants — ${withOutcome.length}`)
+  gradePushes = []
+  const sr2 = await scoreAndRecord(gid);        check(sr2.ok && sr2.result.scored === 4 && gradePushes.length === 4, `20. scoreAndRecord is re-runnable — scored ${sr2.result?.scored ?? sr2.error}, re-pushed ${gradePushes.length}`)
   return gid
 }
 
@@ -338,6 +389,18 @@ async function onlineFlow() {
   // Regroup is now locked (a group has been handed off → seats_locked_at set).
   const regroup = await groupOnline(gid)
   check(!regroup.ok && /re-formed|already started|failed-precondition/i.test(regroup.error ?? ''), `9. regroup locked after hand-off — ${regroup.ok ? 'NOT LOCKED' : regroup.error}`)
+
+  // Grade the online cohort — ≥2 teams with DISTINCT costs, so the z-score has a real spread
+  // (this is the multi-team case the whole feature exists for; the classroom flow was 1 team).
+  gradePushes = []
+  const sr = await scoreAndRecord(gid)
+  check(sr.ok && (sr.result.cohort?.teams ?? 0) >= 2, `10. scoreAndRecord pooled ≥2 teams — ${sr.result?.cohort?.teams ?? sr.error} teams, mean ${sr.result?.cohort?.meanTeamCost}`)
+  check((sr.result?.cohort?.stdTeamCost ?? 0) > 0, `11. distinct team costs → non-zero std (${sr.result?.cohort?.stdTeamCost})`)
+  // Lower team cost → higher (positive) z; higher cost → negative. Both signs must appear.
+  const zs = gradePushes.map((p) => p.normalized_score).filter((z) => typeof z === 'number')
+  check(zs.some((z) => z > 0) && zs.some((z) => z < 0), `12. z-scores span both signs (better + worse teams) — ${[...new Set(zs)].sort((a, b) => a - b).join(', ')}`)
+  // Every pushed row still carries the individual cost as raw_score.
+  check(gradePushes.every((p) => typeof p.raw_score === 'number'), `13. every online grade row carries raw_score (individual cost)`)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

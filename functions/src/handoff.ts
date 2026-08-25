@@ -56,6 +56,48 @@ export async function finalizeGuestSession(gameCode: string): Promise<void> {
   }
 }
 
+/** One human player's costs, as reported by the guest game's results endpoint. */
+export interface GuestResultPlayer {
+  studentId: string;
+  role: string | null;
+  teamId: string | null;
+  teamName: string | null;
+  teamCost: number | null;
+  individualCost: number | null;
+  participated: boolean;
+}
+export interface GuestResults {
+  gameCode: string;
+  teams: Array<{ teamId: string; teamName: string; teamCost: number }>;
+  players: GuestResultPlayer[];
+}
+
+/**
+ * Read one handed-off guest session's per-team + per-player COSTS (Beer Game: getClassResults).
+ * Read-only — does NOT end the session or push grades. scoreAndRecord pools these across every
+ * team in the instance to compute the cross-team z-score. Idempotent and safe to call repeatedly.
+ */
+export async function getGuestResults(gameCode: string): Promise<GuestResults> {
+  const url =
+    process.env.FUNCTIONS_EMULATOR === "true" && process.env.RESULTS_URL_OVERRIDE
+      ? process.env.RESULTS_URL_OVERRIDE
+      : ACTIVE_TENANT.handoff.resultsUrl;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${guestSecret()}` },
+    body: JSON.stringify({ gameCode }),
+  });
+  if (!(res.status >= 200 && res.status < 300)) {
+    throw new Error(`results failed for ${gameCode}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+  }
+  const out = (await res.json()) as Partial<GuestResults>;
+  return {
+    gameCode,
+    teams: Array.isArray(out.teams) ? out.teams : [],
+    players: Array.isArray(out.players) ? out.players : [],
+  };
+}
+
 export async function provisionGroupToTenant(iid: string, groupId: string): Promise<void> {
   const t = ACTIVE_TENANT;
   const groupRef = db().collection("game_instances").doc(iid).collection("groups").doc(groupId);

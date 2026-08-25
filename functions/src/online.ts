@@ -7,7 +7,9 @@
 // round loop here.
 
 import * as admin from "firebase-admin";
+import { FieldValue } from "firebase-admin/firestore";
 import { onCall, type CallableRequest } from "firebase-functions/v2/https";
+import { defineSecret } from "firebase-functions/params";
 import {
   makeStageGroupAdapter,
   makeGroupParticipantsOnline,
@@ -24,9 +26,29 @@ import {
 } from "@mygames/game-server";
 import { matcherGameDef } from "./gameDefinition";
 import { ACTIVE_TENANT } from "./tenants";
-import { provisionGroupToTenant, finalizeGuestSession, PROVISION_SECRET } from "./handoff";
+import {
+  provisionGroupToTenant,
+  finalizeGuestSession,
+  getGuestResults,
+  PROVISION_SECRET,
+  type GuestResultPlayer,
+} from "./handoff";
 
 const db = () => admin.firestore();
+
+// The gradebook callback secret (shared with the classroom; also used to read the roster).
+// The matcher is the grader now, so scoreAndRecord Bearer-auths its grade push with this.
+const CALLBACK_SECRET = defineSecret(ACTIVE_TENANT.rosterSecretName);
+/**
+ * The callback secret value, with the emulator override — same pattern as handoff.guestSecret.
+ * In the functions emulator a defineSecret is not provisioned, so `.value()` is empty; the parent
+ * process env IS propagated, so read the plain env var there. Production uses the real secret.
+ */
+function callbackSecretValue(): string {
+  return process.env.FUNCTIONS_EMULATOR === "true"
+    ? (process.env[ACTIVE_TENANT.rosterSecretName] ?? "emulator-secret")
+    : (CALLBACK_SECRET.value() ?? "");
+}
 
 const onlineDef: OnlineDefinition = {
   seatCount: ACTIVE_TENANT.groupSize,
@@ -155,8 +177,47 @@ export const getOnlineReport = makeGetOnlineReport(ctx, {
  * present (the guest scores absentees/bots out). Idempotent: an already-ended session returns
  * ok and is not re-pushed, so the button is safe to click repeatedly as more groups finish.
  */
+/** One grade row pushed to the classroom's receiveGameResult callback. */
+interface GradeRow {
+  game_instance_id: string;
+  participant_id: string;
+  status: "completed" | "no_show";
+  role: string | null;
+  raw_score: number | null; // Outcome column = the student's INDIVIDUAL cost
+  normalized_score: number | null; // z-score of the student's TEAM cost (higher = lower cost = better)
+  knowledge_check_score: number | null;
+  details: Record<string, unknown>;
+}
+
+async function pushGrade(row: GradeRow, url: string, secret: string): Promise<void> {
+  const retryDelays = [300, 800];
+  for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, retryDelays[attempt - 1]));
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+      body: JSON.stringify(row),
+    });
+    if (res.status >= 200 && res.status < 300) return;
+    if (res.status < 500) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 160)}`);
+  }
+  throw new Error("HTTP 5xx after retries");
+}
+
+/**
+ * scoreAndRecord — the instructor's "Finalize & record" button. The matcher is the GRADER for
+ * its guest game (the guest can only see one team; the z-score needs every team). Steps:
+ *   1. End every handed-off guest session (freeze costs) — idempotent, safe on already-ended.
+ *   2. Read every team's + player's costs (getGuestResults / Beer Game getClassResults).
+ *   3. Pool the TEAM costs across all groups → mean/std → each team's z-score
+ *      (z = (mean − teamCost)/std, so a LOWER cost is a HIGHER, better z; std 0 → all z 0).
+ *   4. Per human player: write raw_score = their INDIVIDUAL cost + finalized_at on the matcher
+ *      participant doc (drives the dashboard Outcome column), and push a gradebook row
+ *      (raw_score = individual cost, normalized_score = team z) to the classroom.
+ * Re-runnable: every call recomputes from current guest state and re-pushes (upsert).
+ */
 export const scoreAndRecord = onCall(
-  { cors: matcherGameDef.corsOrigins, secrets: [PROVISION_SECRET] },
+  { cors: matcherGameDef.corsOrigins, secrets: [PROVISION_SECRET, CALLBACK_SECRET] },
   async (request: CallableRequest) => {
     const data = request.data as Record<string, unknown>;
     const iid = await extractInstructorGameId(
@@ -164,19 +225,109 @@ export const scoreAndRecord = onCall(
       process.env.FUNCTIONS_EMULATOR === "true",
       request.rawRequest.headers.authorization as string | undefined,
     );
-    const groupsSnap = await db().collection("game_instances").doc(iid).collection("groups").get();
+    const instRef = db().collection("game_instances").doc(iid);
+    const groupsSnap = await instRef.collection("groups").get();
     const codes = groupsSnap.docs
       .map((d) => (d.data() as Record<string, unknown>)["gameCode"])
       .filter((c): c is string => typeof c === "string" && c.length > 0);
 
-    let scored = 0;
-    const failed: Array<{ participant_id: string; reason: string }> = [];
+    // 1. End every guest session so its costs are final. Non-fatal per code — a session we
+    //    cannot end still has readable (interim) costs, and grading is re-runnable.
+    let finalized = 0;
+    const finalizeFailed: Array<{ code: string; reason: string }> = [];
     for (const code of codes) {
-      try { await finalizeGuestSession(code); scored++; }
-      catch (e) { failed.push({ participant_id: code, reason: e instanceof Error ? e.message : String(e) }); }
+      try { await finalizeGuestSession(code); finalized += 1; }
+      catch (e) { finalizeFailed.push({ code, reason: e instanceof Error ? e.message : String(e) }); }
     }
-    // Shape mirrors the shared finalize contract ({ ok, scored, push }). The actual grade rows
-    // are pushed by the guest game on end; here `scored` = guest sessions finalized.
-    return { ok: true as const, scored, push: { total: codes.length, succeeded: scored, failed } };
+
+    // 2. Read costs for every session.
+    const results: Array<{ code: string; players: GuestResultPlayer[] }> = [];
+    const resultsFailed: Array<{ code: string; reason: string }> = [];
+    for (const code of codes) {
+      try { const r = await getGuestResults(code); results.push({ code, players: r.players }); }
+      catch (e) { resultsFailed.push({ code, reason: e instanceof Error ? e.message : String(e) }); }
+    }
+
+    // 3. Pool the distinct TEAM costs (one data point per team that has a human) → mean/std.
+    const teamCostByKey = new Map<string, number>();
+    for (const { code, players } of results) {
+      for (const p of players) {
+        if (p.teamId != null && typeof p.teamCost === "number") {
+          teamCostByKey.set(`${code}:${p.teamId}`, p.teamCost);
+        }
+      }
+    }
+    const teamCosts = [...teamCostByKey.values()];
+    const mean = teamCosts.length ? teamCosts.reduce((a, b) => a + b, 0) / teamCosts.length : 0;
+    const variance = teamCosts.length
+      ? teamCosts.reduce((a, b) => a + (b - mean) ** 2, 0) / teamCosts.length
+      : 0;
+    const std = Math.sqrt(variance);
+    // Lower cost is better → positive z. std 0 (all teams equal) → every z is 0.
+    const zFor = (cost: number): number => (std > 0 ? Number(((mean - cost) / std).toFixed(4)) : 0);
+
+    // 4. Grade each human player: Outcome = individual cost, gradebook z = team z.
+    // ⚠ EMULATOR ONLY: the e2e harness points the grade push at its mock classroom. Gated on
+    // FUNCTIONS_EMULATOR (like PROVISION_URL_OVERRIDE) so a deployed matcher can never be
+    // redirected away from the real classroom — and because functions/.env pins
+    // CLASSROOM_CALLBACK_URL to the production URL, which the emulator loads too.
+    const url =
+      process.env.FUNCTIONS_EMULATOR === "true" && process.env.CALLBACK_URL_OVERRIDE
+        ? process.env.CALLBACK_URL_OVERRIDE
+        : (process.env.CLASSROOM_CALLBACK_URL ?? "");
+    const secret = callbackSecretValue();
+    const canPush = Boolean(url && secret);
+
+    const partCol = instRef.collection("participants");
+    let graded = 0;
+    let pushed = 0;
+    const pushFailed: Array<{ participant_id: string; reason: string }> = [];
+
+    for (const { players } of results) {
+      for (const p of players) {
+        const participated = p.participated;
+        const individualCost = typeof p.individualCost === "number" ? p.individualCost : null;
+        const teamZ = typeof p.teamCost === "number" ? zFor(p.teamCost) : null;
+
+        // Dashboard Outcome column + finalized tick (matcher participant doc).
+        await partCol.doc(p.studentId).set(
+          {
+            raw_score: participated ? individualCost : null,
+            finalized_at: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+        graded += 1;
+
+        if (!canPush) continue;
+        const row: GradeRow = {
+          game_instance_id: iid,
+          participant_id: p.studentId,
+          status: participated ? "completed" : "no_show",
+          role: p.role,
+          raw_score: participated ? individualCost : null,
+          normalized_score: participated ? teamZ : null,
+          knowledge_check_score: null,
+          details: {
+            team_name: p.teamName,
+            team_cost: p.teamCost,
+            individual_cost: individualCost,
+            team_z: teamZ,
+          },
+        };
+        try { await pushGrade(row, url, secret); pushed += 1; }
+        catch (e) { pushFailed.push({ participant_id: p.studentId, reason: e instanceof Error ? e.message : String(e) }); }
+      }
+    }
+
+    // Shape stays compatible with the shared finalize contract ({ ok, scored, push }).
+    return {
+      ok: true as const,
+      scored: graded,
+      push: { total: graded, succeeded: pushed, failed: pushFailed },
+      finalize: { total: codes.length, succeeded: finalized, failed: finalizeFailed },
+      results: { failed: resultsFailed },
+      cohort: { teams: teamCosts.length, meanTeamCost: Number(mean.toFixed(2)), stdTeamCost: Number(std.toFixed(2)) },
+    };
   },
 );
