@@ -1,5 +1,5 @@
 import { InstructorDashboard as SharedDashboard } from '@mygames/game-ui'
-import { auth, functions, rtdb } from '../firebase'
+import { authInstructor, functionsInstructor, rtdbInstructor } from '../firebase'
 import { SEATS_PER_GROUP } from '../groupSize'
 import GameControlStrip from './GameControlStrip'
 
@@ -28,9 +28,9 @@ export default function InstructorDashboard() {
       // Gate Match Now on a full group's worth of present students, mirroring
       // gameDefinition.composition ({ player: 4 }).
       composition={{ player: SEATS_PER_GROUP }}
-      functions={functions}
-      auth={auth}
-      rtdb={rtdb}
+      functions={functionsInstructor}
+      auth={authInstructor}
+      rtdb={rtdbInstructor}
       settingsRoute="/settings"
       underHeadline={<GameControlStrip />}
     />

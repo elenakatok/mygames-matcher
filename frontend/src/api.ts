@@ -1,6 +1,6 @@
-import { httpsCallable } from 'firebase/functions'
+import { httpsCallable, type Functions } from 'firebase/functions'
 import { FirebaseError } from 'firebase/app'
-import { functions } from './firebase'
+import { functions, functionsInstructor } from './firebase'
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // THE MATCHER'S CALLABLE SURFACE — front-of-house ONLY.
@@ -27,12 +27,18 @@ function devArgs(): object {
   return iid ? { _dev: { game_instance_id: iid } } : {}
 }
 
-async function callFn<T>(name: string, data: object = {}): Promise<T> {
+async function callOn<T>(instance: Functions, name: string, data: object = {}): Promise<T> {
   data = { ...devArgs(), ...data }
-  const fn = httpsCallable<object, T>(functions, name)
+  const fn = httpsCallable<object, T>(instance, name)
   const result = await fn(data)
   return result.data
 }
+
+// ⚠ TWO Firebase apps (see firebase.ts): student callables must go through the STUDENT app
+// and instructor callables through the INSTRUCTOR app, or the token attached is the wrong
+// session's. callFn = student; callFnInstructor = instructor.
+const callFn = <T>(name: string, data: object = {}) => callOn<T>(functions, name, data)
+const callFnInstructor = <T>(name: string, data: object = {}) => callOn<T>(functionsInstructor, name, data)
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -109,8 +115,8 @@ export const flagGroup = (args: CallArgs = {} as BearerArgs) =>
 
 // ── Clock-mode control (per-instance setting; instructor sets before matching) ──
 export type GameConfig = { ok: boolean; clock_mode?: string; instructor_email?: string }
-export const getGameConfig = () => callFn<GameConfig>('getGameConfig', {})
-export const setClockMode = (mode: 'on' | 'off') => callFn<GameConfig>('updateGameConfig', { clock_mode: mode })
+export const getGameConfig = () => callFnInstructor<GameConfig>('getGameConfig', {})
+export const setClockMode = (mode: 'on' | 'off') => callFnInstructor<GameConfig>('updateGameConfig', { clock_mode: mode })
 
 // ── Instructor API ────────────────────────────────────────────────────────────
 
@@ -120,20 +126,20 @@ export type InstructorSessionArgs =
 
 /** Bootstrap — no session yet; JWT travels in data; SDK attaches nothing. */
 export const getInstructorSession = (args: InstructorSessionArgs) =>
-  callFn<{ ok: boolean; customToken: string }>('getInstructorSession', args)
+  callFnInstructor<{ ok: boolean; customToken: string }>('getInstructorSession', args)
 
 /** Remaining instructor calls: SDK auto-attaches Firebase Bearer when session exists. */
 export const syncRoster = () =>
-  callFn<{ ok: boolean; synced: number; skipped: number }>('syncRoster', {})
+  callFnInstructor<{ ok: boolean; synced: number; skipped: number }>('syncRoster', {})
 
 export const generateAttendanceCode = () =>
-  callFn<{ ok: boolean; code: string }>('generateAttendanceCode', {})
+  callFnInstructor<{ ok: boolean; code: string }>('generateAttendanceCode', {})
 
 // The classroom matcher: forms full groups of `groupSize` from present, eligible
 // students (shared triggerMatching; keys on attendance + presence). A remainder < groupSize
 // is left in the No-Group pool — top it up to full with placeholder seats to hand it off.
 export const triggerMatching = () =>
-  callFn<{ ok: boolean; groups: unknown[]; alreadyMatched?: boolean }>('triggerMatching', {})
+  callFnInstructor<{ ok: boolean; groups: unknown[]; alreadyMatched?: boolean }>('triggerMatching', {})
 
 // ── Online-mode instructor grouping + seat management ────────────────────────────
 
@@ -162,18 +168,18 @@ export type OnlineMember = { participant_id: string; display_name: string; email
 
 /** Pre-form random groups from the whole roster (online mode; re-runnable until the first handoff). */
 export const groupParticipantsOnline = () =>
-  callFn<{ ok: boolean; groups: number; full_groups: number; short_group_size: number | null; total_humans: number }>(
+  callFnInstructor<{ ok: boolean; groups: number; full_groups: number; short_group_size: number | null; total_humans: number }>(
     'groupParticipantsOnline', {})
 
 /** The online groups (with members) + the No-Group pool, for the grouping panel. */
 export const getOnlineGroups = () =>
-  callFn<{ ok: boolean; seat_count: number; groups: OnlineGroup[]; no_group: OnlineOccupant[] }>(
+  callFnInstructor<{ ok: boolean; seat_count: number; groups: OnlineGroup[]; no_group: OnlineOccupant[] }>(
     'getOnlineGroups', {})
 
 /** Move a human into another group (both modes; rejected once a group is handed off / locked).
  *  If the destination is full but has a placeholder seat, the move evicts one — evicted_bot names it. */
 export const moveSeat = (participantId: string, targetGroupId: string) =>
-  callFn<{ ok: boolean; moved: boolean; evicted_bot?: string | null }>('moveSeat', { participant_id: participantId, target_group_id: targetGroupId })
+  callFnInstructor<{ ok: boolean; moved: boolean; evicted_bot?: string | null }>('moveSeat', { participant_id: participantId, target_group_id: targetGroupId })
 
 /**
  * Fill a group's empty seats with placeholder seats so a SHORT group can be handed off.
@@ -186,7 +192,7 @@ export const moveSeat = (participantId: string, targetGroupId: string) =>
  * placeholder seats never reach the guest game.
  */
 export const topUpGroupWithBots = (groupId: string) =>
-  callFn<{ ok: boolean; added: number }>('topUpGroupWithBots', { group_id: groupId })
+  callFnInstructor<{ ok: boolean; added: number }>('topUpGroupWithBots', { group_id: groupId })
 
 /**
  * The ONE "Start class" control — shared, idempotent, re-pressable. For the matcher,
@@ -195,7 +201,7 @@ export const topUpGroupWithBots = (groupId: string) =>
  * since, and skips groups already handed off.
  */
 export const startAllGroups = () =>
-  callFn<{ ok: boolean; started: number; skipped_short?: number; already_running?: number }>('startAllGroups', {})
+  callFnInstructor<{ ok: boolean; started: number; skipped_short?: number; already_running?: number }>('startAllGroups', {})
 
 // ── End-of-assignment operational report — "who arrived / who is in a game" ──
 export type GroupCategory = 'finished' | 'in_progress' | 'never_started'
@@ -230,4 +236,4 @@ export type OnlineReport = {
   groups: OnlineReportGroup[]
   students: OnlineReportStudent[]
 }
-export const getOnlineReport = () => callFn<OnlineReport>('getOnlineReport', {})
+export const getOnlineReport = () => callFnInstructor<OnlineReport>('getOnlineReport', {})

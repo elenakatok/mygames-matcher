@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { onAuthStateChanged } from 'firebase/auth'
 import { collection, onSnapshot } from 'firebase/firestore'
-import { auth, db } from '../firebase'
+import { authInstructor as auth, dbInstructor as db } from '../firebase'
 import { SEATS_PER_GROUP } from '../groupSize'
 import { GroupsPanel, MoveMemberControl, colors, typography, spacing, type GroupsPanelRow } from '@mygames/game-ui'
 import OnlineMatchControl, { GROUP_BUTTON_LABEL } from './OnlineMatchControl'

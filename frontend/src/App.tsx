@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
-import { auth, functions } from './firebase'
+import { authInstructor, functionsInstructor } from './firebase'
 import Play from './pages/Play'
 import InstructorDashboard from './pages/InstructorDashboard'
 import { configSections } from './configSections'
@@ -22,8 +22,8 @@ export default function App() {
         <Route path="/settings"  element={
           <SettingsPage
             title="Settings — The Beer Game"
-            functions={functions}
-            auth={auth}
+            functions={functionsInstructor}
+            auth={authInstructor}
             roleLabels={roleLabels}
             showReservationPrices={false}
             configSections={configSections}
