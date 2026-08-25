@@ -61,9 +61,24 @@ async function routeToPhase(
   )
   const d = snap.data() ?? {}
 
+  // ── Read the group once (if any) — used for both the online detection and the reveal ──
+  let group: Record<string, unknown> | undefined
+  if (d.group_id) {
+    const gsnap = await getDoc(doc(db, 'game_instances', gameInstanceId, 'groups', d.group_id as string))
+    group = gsnap.exists() ? (gsnap.data() as Record<string, unknown>) : undefined
+  }
+  const isOnlineGroup = Array.isArray(group?.members)
+
+  // ⚠ ONLINE STUDENTS MUST NEVER SEE THE ATTENDANCE-CODE / "I'm in class" SCREENS. A student
+  // who has been placed in an ONLINE-FORMED group (it carries members[]) is, by definition,
+  // in an online session — so route them online even if the mode signal came back 'on' (a
+  // flaky recordLogin, or the instructor flipping to online after the student loaded). This
+  // is what makes online play bypass the code screen reliably.
+  const effectiveMode: Mode = mode === 'off' || isOnlineGroup ? 'off' : 'on'
+
   // ── Underlying phase ────────────────────────────────────────────────────────
   let phase: GamePhase
-  if (mode === 'off') {
+  if (effectiveMode === 'off') {
     // ONLINE: no attendance code, no waiting room. Grouped → hand-off screen; not yet → holding.
     phase = d.group_id ? { name: 'matched', groupId: d.group_id as string } : { name: 'online_holding' }
   } else {
@@ -75,16 +90,11 @@ async function routeToPhase(
   }
 
   // ── Online reveal gate: a pre-grouped student sees their group first, until it locks ──
-  // Only for a group formed by online grouping (it carries members[]); a group without
-  // members[] never triggers the reveal. seats_locked_at is stamped at hand-off, so the
-  // reveal shows until the group is handed off to the Beer Game.
+  // Only for a group formed by online grouping (members[]); seats_locked_at is stamped at
+  // hand-off, so the reveal shows until the group is handed off to the Beer Game.
   let revealGroupId: string | null = null
-  if (mode === 'off' && d.group_id) {
-    const gsnap = await getDoc(doc(db, 'game_instances', gameInstanceId, 'groups', d.group_id as string))
-    const g = gsnap.exists() ? gsnap.data() : undefined
-    const isOnlineGroup = Array.isArray(g?.members)
-    const locked = g?.seats_locked_at != null
-    if (isOnlineGroup && !locked) revealGroupId = d.group_id as string
+  if (effectiveMode === 'off' && d.group_id && isOnlineGroup && group?.seats_locked_at == null) {
+    revealGroupId = d.group_id as string
   }
 
   return { phase, revealGroupId }

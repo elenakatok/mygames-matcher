@@ -288,6 +288,12 @@ async function onlineFlow() {
 
   const gp = await groupOnline(gid); check(gp.ok && gp.result.total_humans === 6, `2. groupParticipantsOnline — ${gp.result?.total_humans ?? gp.error} humans, ${gp.result?.groups} group(s)`)
 
+  // ⚠ ARRIVAL-BASED START: before anyone logs in, a FULL pre-grouped group is a group of
+  // no-shows — Start must hand off NOTHING and wait, not lock everyone.
+  const stEarly = await startAll(gid)
+  check(stEarly.result.started === 0 && (stEarly.result.skipped_waiting ?? 0) >= 1,
+    `2a. Start before any login hands off nothing (waiting on no-shows) — started ${stEarly.result.started}, waiting ${stEarly.result.skipped_waiting}`)
+
   // Students arrive (recordLogin returns the online mode so the client routes correctly).
   let modeOk = true
   for (const pid of ROSTER.map((r) => r.participant_id)) {
