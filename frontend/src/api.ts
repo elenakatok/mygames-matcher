@@ -69,6 +69,11 @@ export function playLinkFor(gameCode: string, participantId: string): string {
   return `${PLAY_URL}/?class=${encodeURIComponent(gameCode)}&sid=${encodeURIComponent(participantId)}`
 }
 
+/** The instructor's read-only report for a handed-off group (orders + inventory over time). */
+export function reportLinkFor(gameCode: string): string {
+  return `${PLAY_URL}/?report=${encodeURIComponent(gameCode)}`
+}
+
 // onCall auth errors arrive as FirebaseError with code 'functions/permission-denied'
 // or 'functions/unauthenticated' — not HTTP status strings.
 export function isAuthError(err: unknown): boolean {

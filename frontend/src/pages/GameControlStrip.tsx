@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { onAuthStateChanged } from 'firebase/auth'
-import { auth } from '../firebase'
+import { collection, onSnapshot } from 'firebase/firestore'
+import { auth, db } from '../firebase'
 import { SEATS_PER_GROUP } from '../groupSize'
 import { GroupsPanel, MoveMemberControl, colors, typography, spacing, type GroupsPanelRow } from '@mygames/game-ui'
 import OnlineMatchControl, { GROUP_BUTTON_LABEL } from './OnlineMatchControl'
 import PanelBoundary from './PanelBoundary'
 import {
   getGameConfig, setClockMode, getOnlineGroups, moveSeat, topUpGroupWithBots, startAllGroups,
-  type OnlineGroup,
+  reportLinkFor, type OnlineGroup,
 } from '../api'
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -91,6 +92,35 @@ export default function GameControlStrip() {
   const [sessionReady, setSessionReady] = useState(false)
   useEffect(() => onAuthStateChanged(auth, (u) => setSessionReady(!!u)), [])
 
+  /*
+    ── PER-GROUP GAME CODES → the "Report" link ──────────────────────────────────
+    getOnlineGroups (a shared factory) does not carry each group's guest-game `gameCode`,
+    so read the group docs directly: the instructor is authenticated and the rules allow an
+    authed read of groups. The instance id is the instructor uid's suffix
+    (`instructor_<gid>`, makeGetInstructorSession). The gameCode is what the Beer Game report
+    is keyed on, and it appears once a group is handed off.
+  */
+  const [gameCodes, setGameCodes] = useState<Record<string, string>>({})
+  useEffect(() => {
+    const uid = auth.currentUser?.uid
+    if (!sessionReady || !uid) return
+    const gid = uid.replace(/^instructor_/, '')
+    if (!gid || gid === uid) return
+    const unsub = onSnapshot(
+      collection(db, 'game_instances', gid, 'groups'),
+      (snap) => {
+        const map: Record<string, string> = {}
+        for (const d of snap.docs) {
+          const code = (d.data() as Record<string, unknown>)['gameCode']
+          if (typeof code === 'string' && code) map[d.id] = code
+        }
+        setGameCodes(map)
+      },
+      () => { /* best-effort; the Report link just won't appear */ },
+    )
+    return () => unsub()
+  }, [sessionReady])
+
   const STARTUP_GRACE = 4
 
   const refresh = useCallback(async () => {
@@ -156,6 +186,7 @@ export default function GameControlStrip() {
     const humanMembers = g.occupants
       .filter((o) => !o.is_bot)
       .map((o) => ({ participantId: o.participant_id, name: o.display_name }))
+    const code = gameCodes[g.group_id]
     return {
       key: g.group_id,
       number: g.group_number,
@@ -164,6 +195,18 @@ export default function GameControlStrip() {
       filled: g.occupants.length,
       seatCount: g.seat_count ?? SEATS_PER_GROUP,
       bots,
+      // Once a group is handed off it carries a Beer Game code — link to its report
+      // (orders + inventory over time). Shown even on locked rows (badge renders regardless).
+      badge: code ? (
+        <a
+          data-testid={`report-${g.group_number}`}
+          href={reportLinkFor(code)}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ fontSize: typography.sizeXs, color: colors.textSecondary, textDecoration: 'underline' }}
+          title="Open this group's Beer Game report (orders + inventory over time)"
+        >Report ↗</a>
+      ) : undefined,
       // Handed off == seats locked (seats_locked_at set at hand-off). GroupsPanel renders
       // "🔒 locked" instead of the move/fill actions, freezing a group that is already in
       // the Beer Game while its not-yet-handed-off siblings stay rearrangeable.
