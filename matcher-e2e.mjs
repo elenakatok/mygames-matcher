@@ -74,6 +74,7 @@ const asDev     = (gid, extra = {}) => ({ _dev: { game_instance_id: gid }, ...ex
 // ── the mock classroom (roster source) + mock Beer Game (provisioning sink) ──────
 let cbServer = null
 let provisionRequests = []   // every hand-off body the mock Beer Game received
+let finalizeRequests = []    // every gameCode the mock Beer Game was asked to finalize
 let rosterRequests = 0
 let nextGameCode = 1
 const ROSTER = [
@@ -99,6 +100,11 @@ function startClassroom() {
           const code = `BEER${String(nextGameCode++).padStart(3, '0')}`
           r.end(JSON.stringify({ gameCode: code })); return
         }
+        // A finalize carries `gameCode` and no groups — record it, ack ended.
+        if (parsed && typeof parsed.gameCode === 'string' && !parsed.groups) {
+          finalizeRequests.push(parsed.gameCode)
+          r.end(JSON.stringify({ ok: true })); return
+        }
         // Otherwise it is a roster pull.
         rosterRequests++
         r.end(JSON.stringify({ participants: ROSTER, instructor_email: 'prof@example.edu' }))
@@ -122,6 +128,7 @@ async function bringUp() {
     { cwd: ROOT, detached: true, stdio: ['ignore', log, log],
       env: { ...process.env,
              PROVISION_URL_OVERRIDE: CB,
+             FINALIZE_URL_OVERRIDE: CB,
              PROVISION_SECRET_BEERGAME: PROVISION_SECRET } }))
   const start = Date.now()
   for (;;) {
@@ -149,6 +156,7 @@ const confirmReady = (gid, pid) => callFn('confirmReady', asStudent(gid, pid, {}
 const verifyAttend = (gid, pid, code) => callFn('verifyAttendanceCode', asStudent(gid, pid, { code }))
 const matchNow   = (gid) => callFn('triggerMatching', asDev(gid, {}))
 const startAll   = (gid) => callFn('startAllGroups', asDev(gid, {}))
+const scoreAndRecord = (gid) => callFn('scoreAndRecord', asDev(gid, {}))
 const getRoster  = (gid) => callFn('getRoster', asDev(gid, {}))
 const getOnline  = (gid) => callFn('getOnlineGroups', asDev(gid, {}))
 const groupOnline = (gid) => callFn('groupParticipantsOnline', asDev(gid, {}))
@@ -237,6 +245,13 @@ async function classroomFlow() {
   // Re-press Start: idempotent, hands off nothing new (the group already carries a code).
   const st2 = await startAll(gid);              check(st2.ok && st2.result.started === 0, `12. re-press Start is idempotent — started ${st2.result?.started ?? st2.error}`)
   check(provisionRequests.length === before + 1, `13. no duplicate hand-off on re-press`)
+
+  // Finalize & record — ends the handed-off guest session (grades everyone present),
+  // WITHOUT waiting for the game to finish, and is re-runnable.
+  finalizeRequests.length = 0
+  const sr = await scoreAndRecord(gid);         check(sr.ok && sr.result.scored === 1, `14. scoreAndRecord finalizes the handed-off group — scored ${sr.result?.scored ?? sr.error}`)
+  check(finalizeRequests.length === 1 && finalizeRequests[0] === gdoc?.gameCode, `15. mock Beer Game got finalize for the gameCode — ${finalizeRequests.join(',')}`)
+  const sr2 = await scoreAndRecord(gid);        check(sr2.ok && sr2.result.scored === 1, `16. scoreAndRecord is re-runnable — scored ${sr2.result?.scored ?? sr2.error}`)
   return gid
 }
 

@@ -66,6 +66,7 @@ export {
   flagGroup,
   startAllGroups,
   getOnlineReport,
+  scoreAndRecord,
 } from "./online";
 
 // ── health ─────────────────────────────────────────────────────────────────────

@@ -33,6 +33,12 @@ export default function InstructorDashboard() {
       rtdb={rtdbInstructor}
       reportsRoute="/reports"
       settingsRoute="/settings"
+      // ⚠ Opt into the re-runnable "Finalize & record" button (not the run-once Finalize).
+      // The matcher never grades — this ENDS every handed-off Beer Game session, which makes
+      // each push its participation grades. It is always available and safe to click again as
+      // more groups finish, so a team that never finished (a member left) no longer blocks
+      // grading everyone else. See functions/src/online.ts scoreAndRecord.
+      scoreAndRecord={{ callableName: 'scoreAndRecord', label: 'Finalize & record' }}
       underHeadline={<GameControlStrip />}
     />
   )

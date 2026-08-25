@@ -24,7 +24,7 @@ import {
 } from "@mygames/game-server";
 import { matcherGameDef } from "./gameDefinition";
 import { ACTIVE_TENANT } from "./tenants";
-import { provisionGroupToTenant, PROVISION_SECRET } from "./handoff";
+import { provisionGroupToTenant, finalizeGuestSession, PROVISION_SECRET } from "./handoff";
 
 const db = () => admin.firestore();
 
@@ -143,3 +143,40 @@ export const getOnlineReport = makeGetOnlineReport(ctx, {
   progressOf,
   absenceLabel: "Not yet arrived",
 });
+
+/**
+ * "Finalize & record" — the dashboard's always-available, re-runnable Finalize button.
+ *
+ * The matcher never grades; the guest game does, pushing participation grades when its session
+ * ENDS. So finalizing here = ending every handed-off guest session (finalizeGuestSession),
+ * which triggers each one's grade push. ⚠ IT DOES NOT WAIT FOR EVERYONE TO FINISH — that is
+ * the whole point: a team whose member left never ends on its own, so without this the
+ * students who DID take part are never graded. Ending a still-running session grades everyone
+ * present (the guest scores absentees/bots out). Idempotent: an already-ended session returns
+ * ok and is not re-pushed, so the button is safe to click repeatedly as more groups finish.
+ */
+export const scoreAndRecord = onCall(
+  { cors: matcherGameDef.corsOrigins, secrets: [PROVISION_SECRET] },
+  async (request: CallableRequest) => {
+    const data = request.data as Record<string, unknown>;
+    const iid = await extractInstructorGameId(
+      data,
+      process.env.FUNCTIONS_EMULATOR === "true",
+      request.rawRequest.headers.authorization as string | undefined,
+    );
+    const groupsSnap = await db().collection("game_instances").doc(iid).collection("groups").get();
+    const codes = groupsSnap.docs
+      .map((d) => (d.data() as Record<string, unknown>)["gameCode"])
+      .filter((c): c is string => typeof c === "string" && c.length > 0);
+
+    let scored = 0;
+    const failed: Array<{ participant_id: string; reason: string }> = [];
+    for (const code of codes) {
+      try { await finalizeGuestSession(code); scored++; }
+      catch (e) { failed.push({ participant_id: code, reason: e instanceof Error ? e.message : String(e) }); }
+    }
+    // Shape mirrors the shared finalize contract ({ ok, scored, push }). The actual grade rows
+    // are pushed by the guest game on end; here `scored` = guest sessions finalized.
+    return { ok: true as const, scored, push: { total: codes.length, succeeded: scored, failed } };
+  },
+);

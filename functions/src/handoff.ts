@@ -27,6 +27,35 @@ const db = () => admin.firestore();
  * seats (bots excluded — the guest game bot-fills its own empty seats), POSTs them, and
  * writes the returned game code back onto the group doc.
  */
+/** The provisioning secret (shared with the guest game), with the emulator override. */
+function guestSecret(): string {
+  return process.env.FUNCTIONS_EMULATOR === "true"
+    ? (process.env[ACTIVE_TENANT.handoff.secretName] ?? "emulator-secret")
+    : PROVISION_SECRET.value();
+}
+
+/**
+ * Finalize (end) one handed-off guest session by its gameCode. Ending the session is what
+ * makes the guest push participation grades to the classroom (Beer Game: finalizeClassSession
+ * → onGameEndedPushResults). Idempotent — an already-ended session returns ok and does not
+ * re-push. Used by scoreAndRecord so an instructor can close out an instance and grade the
+ * students who took part even if a group never finished (a member left mid-game).
+ */
+export async function finalizeGuestSession(gameCode: string): Promise<void> {
+  const url =
+    process.env.FUNCTIONS_EMULATOR === "true" && process.env.FINALIZE_URL_OVERRIDE
+      ? process.env.FINALIZE_URL_OVERRIDE
+      : ACTIVE_TENANT.handoff.finalizeUrl;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${guestSecret()}` },
+    body: JSON.stringify({ gameCode }),
+  });
+  if (!(res.status >= 200 && res.status < 300)) {
+    throw new Error(`finalize failed for ${gameCode}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+  }
+}
+
 export async function provisionGroupToTenant(iid: string, groupId: string): Promise<void> {
   const t = ACTIVE_TENANT;
   const groupRef = db().collection("game_instances").doc(iid).collection("groups").doc(groupId);
@@ -63,18 +92,13 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
     process.env.FUNCTIONS_EMULATOR === "true" && process.env.PROVISION_URL_OVERRIDE
       ? process.env.PROVISION_URL_OVERRIDE
       : t.handoff.provisionUrl;
-  const secret =
-    process.env.FUNCTIONS_EMULATOR === "true"
-      ? (process.env[t.handoff.secretName] ?? "emulator-secret")
-      : PROVISION_SECRET.value();
-
   const config = await buildGuestConfig(iid);
 
   const res = await fetch(provisionUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${secret}`,
+      Authorization: `Bearer ${guestSecret()}`,
     },
     body: JSON.stringify({ instanceId: iid, groups: [{ groupId, members }], config }),
   });
