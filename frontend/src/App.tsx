@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { authInstructor, functionsInstructor } from './firebase'
 import Play from './pages/Play'
 import InstructorDashboard from './pages/InstructorDashboard'
+import MatcherReports from './pages/MatcherReports'
 import { configSections } from './configSections'
 import { SettingsPage } from '@mygames/game-ui'
 
@@ -19,6 +20,7 @@ export default function App() {
       <Routes>
         <Route path="/"          element={<Play />} />
         <Route path="/dashboard" element={<InstructorDashboard />} />
+        <Route path="/reports"   element={<MatcherReports />} />
         <Route path="/settings"  element={
           <SettingsPage
             title="Settings — The Beer Game"

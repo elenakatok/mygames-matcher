@@ -31,6 +31,7 @@ export default function InstructorDashboard() {
       functions={functionsInstructor}
       auth={authInstructor}
       rtdb={rtdbInstructor}
+      reportsRoute="/reports"
       settingsRoute="/settings"
       underHeadline={<GameControlStrip />}
     />
