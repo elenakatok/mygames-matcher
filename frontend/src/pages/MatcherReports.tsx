@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { signInWithCustomToken, signOut, setPersistence, browserSessionPersistence } from 'firebase/auth'
 import { collection, onSnapshot } from 'firebase/firestore'
 import { authInstructor, dbInstructor } from '../firebase'
 import { getInstructorSession, reportLinkFor, CLASSROOM_URL } from '../api'
-import { colors, typography, spacing } from '@mygames/game-ui'
+import { colors, typography, spacing, layout, GameHeader } from '@mygames/game-ui'
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // The matcher's Reports page — reached from the dashboard's "Reports →" button, like every
@@ -31,6 +32,14 @@ export default function MatcherReports() {
   const [error, setError]   = useState<string | null>(null)
   const [groups, setGroups] = useState<Group[]>([])
   const [sel, setSel]       = useState(0)
+
+  // Back to the dashboard, preserving the launch context (same rule as the Settings page's
+  // makeLink) so the in-SPA nav lands on the signed-in dashboard, not a token-less cold load.
+  const navigate = useNavigate()
+  const dashLink =
+    devGid ? `/dashboard?_dev_game_instance_id=${encodeURIComponent(devGid)}`
+    : (token && gid) ? `/dashboard?token=${encodeURIComponent(token)}&game_instance_id=${encodeURIComponent(gid)}`
+    : '/dashboard'
 
   // ── Resume (or exchange for) the instructor session ──────────────────────────
   useEffect(() => {
@@ -81,22 +90,41 @@ export default function MatcherReports() {
 
   const iframeSrc = useMemo(() => (groups[sel] ? reportLinkFor(groups[sel].gameCode) : null), [groups, sel])
 
-  const wrap: React.CSSProperties = { maxWidth: 1000, margin: '0 auto', padding: `1.5rem ${spacing.gapLg ?? '1.5rem'}`, fontFamily: typography.fontFamily }
+  const mainWrap: React.CSSProperties = { maxWidth: 1000, margin: '0 auto', padding: layout.pagePad, fontFamily: typography.fontFamily }
+
+  // The shared header (logo + "← Dashboard" + title), identical to the Settings page so the two
+  // sibling pages look and navigate the same way.
+  const header = (
+    <>
+      <GameHeader />
+      <div style={{ background: colors.white, borderBottom: `1px solid ${colors.borderMid}`, padding: `0.625rem ${layout.pagePad}` }}>
+        <div style={{ maxWidth: 1000, margin: '0 auto', display: 'flex', alignItems: 'center', gap: spacing.gapXl }}>
+          <button onClick={() => navigate(dashLink)} style={{ fontSize: '0.875rem', padding: '0.3rem 0.75rem' }}>
+            ← Dashboard
+          </button>
+          <h1 style={{ margin: 0, fontSize: '1.125rem', fontWeight: 600 }}>Reports — The Beer Game</h1>
+        </div>
+      </div>
+    </>
+  )
 
   if (error) {
     return (
-      <main style={wrap}>
-        <h1 style={{ marginTop: 0 }}>Reports — The Beer Game</h1>
-        <p style={{ color: '#c00' }}>{error}</p>
-        <p><a href={CLASSROOM_URL}>← Return to classroom</a></p>
-      </main>
+      <>
+        {header}
+        <main style={mainWrap}>
+          <p style={{ color: colors.errorAction }}>{error}</p>
+          <p><a href={CLASSROOM_URL}>← Return to classroom</a></p>
+        </main>
+      </>
     )
   }
-  if (!ready) return <main style={wrap}><p>Loading…</p></main>
+  if (!ready) return <>{header}<main style={mainWrap}><p>Loading…</p></main></>
 
   return (
-    <main style={wrap}>
-      <h1 style={{ marginTop: 0, marginBottom: spacing.gapSm }}>Reports — The Beer Game</h1>
+    <>
+      {header}
+      <main style={mainWrap}>
       <p style={{ color: colors.textSecondary, marginTop: 0 }}>
         Orders and inventory over time, by group. Pick a group to see its report.
       </p>
@@ -132,6 +160,7 @@ export default function MatcherReports() {
           )}
         </>
       )}
-    </main>
+      </main>
+    </>
   )
 }

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="280" height="56" viewBox="0 0 280 56" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif">
+  <g transform="translate(2,10) scale(0.34)">
+    <path d="M50 26 c-7 -4 -17 -2 -20 5 c-7 -1 -12 5 -11 11 c-5 3 -5 10 0 13 c-1 6 4 11 10 10 c2 5 9 7 13 3 l0 5 l8 0 z" fill="#D38626"/>
+    <g stroke="#0f1830" stroke-width="1.8" fill="none" opacity="0.35" stroke-linecap="round">
+      <path d="M38 38 q5 3 0 7 q-5 3 0 7"/>
+      <path d="M30 46 q4 -3 8 0"/>
+    </g>
+    <g stroke="#fde9c8" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M58 36 h9 v-8"/>
+      <path d="M58 50 h14 M72 50 v-9"/>
+      <path d="M58 64 h9 v8"/>
+      <path d="M67 64 h7"/>
+    </g>
+    <circle cx="67" cy="28" r="3.6" fill="#fde9c8"/>
+    <circle cx="72" cy="41" r="3.6" fill="#fde9c8"/>
+    <circle cx="74" cy="64" r="3.6" fill="#fde9c8"/>
+    <circle cx="67" cy="72" r="3.6" fill="#fde9c8"/>
+  </g>
+  <text x="40" y="37" font-size="26" font-weight="700" fill="#D38626">myGames</text>
+  <text x="179" y="37" font-size="26" font-weight="300" fill="#e8b878">.live</text>
+  <circle cx="242" cy="20" r="4.5" fill="#22c55e"/>
+</svg>
