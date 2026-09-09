@@ -70,10 +70,23 @@ export const PLAY_URL =
   (import.meta.env.VITE_PLAY_URL as string | undefined)?.replace(/\/$/, '') ??
   'https://beergame-mygames-live.web.app'
 
-/** The student's deep link into the guest game's play, once their group is handed off. */
+/**
+ * ⚠ DEAD as of the seat-token pass (D2), kept only so D12 can retire it deliberately.
+ * The play link now carries a signed `t` token, and the HMAC needs the shared provisioning
+ * secret — which a browser must never hold. Links are minted server-side by getSeatLink.
+ * Do NOT call this: a link without `t` is refused by the guest.
+ */
 export function playLinkFor(gameCode: string, participantId: string): string {
   return `${PLAY_URL}/?class=${encodeURIComponent(gameCode)}&sid=${encodeURIComponent(participantId)}`
 }
+
+/**
+ * Mint this student's short-lived signed deep link into the guest game (D2).
+ * Called on every render of the redirect screen, so an expiry measured in seconds costs
+ * nothing — see functions/src/seatToken.ts for why it is 120s.
+ */
+export const getSeatLink = (args: CallArgs = {} as BearerArgs) =>
+  callFn<{ url: string; expires_in: number }>('getSeatLink', args)
 
 /** The instructor's read-only report for a handed-off group (orders + inventory over time). */
 export function reportLinkFor(gameCode: string): string {

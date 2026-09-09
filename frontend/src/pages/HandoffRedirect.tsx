@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { doc, onSnapshot } from 'firebase/firestore'
 import { colors, typography, layout, spacing } from '@mygames/game-ui'
 import { db } from '../firebase'
-import { playLinkFor } from '../api'
+import { getSeatLink } from '../api'
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // THE HAND-OFF, STUDENT SIDE — the one genuinely new screen in the matcher, and the
@@ -40,7 +40,17 @@ export default function HandoffRedirect({
         const gameCode = snap.exists() ? (snap.data()?.gameCode as string | undefined) : undefined
         if (gameCode && !redirected.current) {
           redirected.current = true
-          window.location.href = playLinkFor(gameCode, participantId)
+          // ⚠ D2: the link is MINTED SERVER-SIDE and carries a signed, short-lived seat
+          // token. It cannot be assembled here — the HMAC needs the shared provisioning
+          // secret, which must never reach a browser. If minting fails we show the error
+          // rather than falling back to an unsigned link: per D1 there is no fallback, and
+          // an unsigned link is exactly the defect this pass removes.
+          getSeatLink()
+            .then(({ url }) => { window.location.href = url })
+            .catch((e) => {
+              redirected.current = false
+              setError(e instanceof Error ? e.message : 'Could not open your game link.')
+            })
         }
       },
       (e) => setError(e instanceof Error ? e.message : 'Could not read your group.'),

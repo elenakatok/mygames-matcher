@@ -20,6 +20,29 @@
 // can never be redirected by it.
 //
 //   node matcher-e2e.mjs        (env KEEP=1 leaves the stack up)
+//
+// ⚠⚠ THIS RUN LEAVES A STALE EMULATOR-HUB LOCATOR BEHIND, AND IT WILL BREAK YOUR NEXT
+// DEPLOY FROM THIS DIRECTORY. Measured 2026-09-09: it happens on EVERY run — a clean,
+// natural exit (47/47 passed) left one just as a pkill/kill -9 did. Do not assume a tidy
+// shutdown avoids it.
+//
+//     /var/folders/<...>/T/hub-matcher-mygames-live.json
+//
+// The next `firebase deploy` finds that file, believes emulators are running for the
+// project, and dies during functions discovery with:
+//     Serving at port <NNNN>
+//     Error: Failed to list functions for matcher-mygames-live
+// It names the PROJECT and gives no hint that a temp file in /var/folders is responsible,
+// so it reads like an auth or API-enablement problem and sends you hunting in the wrong
+// place. This cost a broken production window on 2026-09-09: pass A's guest half was
+// already deployed, the matcher half failed on exactly this, and every matcher→guest call
+// 400'd until it was found.
+//
+// SO: after any run of this file, before deploying —
+//     rm -f "$TMPDIR"/hub-matcher-mygames-live.json
+//
+// (Stopping with a single Ctrl-C rather than a hard kill is still better practice — it lets
+// the emulators shut down in order — but it does NOT prevent the locator.)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { openSync, mkdirSync, writeSync } from 'node:fs'

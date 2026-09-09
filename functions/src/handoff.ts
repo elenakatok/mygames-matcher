@@ -16,6 +16,7 @@ import * as admin from "firebase-admin";
 import { FieldValue } from "firebase-admin/firestore";
 import { defineSecret } from "firebase-functions/params";
 import { ACTIVE_TENANT } from "./tenants";
+import { mintSeatToken, SEAT_TOKEN_TTL_SECONDS } from "./seatToken";
 
 // Single-tenant deploy: the provisioning secret name is fixed per deployment.
 export const PROVISION_SECRET = defineSecret(ACTIVE_TENANT.handoff.secretName);
@@ -233,8 +234,34 @@ async function buildGuestConfig(iid: string): Promise<Record<string, unknown>> {
   return { nWeeks, customerDemand };
 }
 
-/** The student's deep link into the guest game's play, once their group is handed off. */
-export function playLinkFor(gameCode: string, participantId: string): string {
+/**
+ * The student's deep link into the guest game's play, once their group is handed off.
+ *
+ * ⚠ D2: the link now carries a SIGNED SEAT TOKEN (`t`). `sid` alone is no longer a
+ * credential — the guest refuses it. That is why this function, which used to have no
+ * caller at all (the matcher frontend built the URL itself), is now the ONLY place a play
+ * link is made: the HMAC needs the shared secret, and the browser must never hold it.
+ * (Collapsing the frontend's now-unused copy is D12, pass C.)
+ */
+export function playLinkFor(gameCode: string, participantId: string, seatToken: string): string {
   const base = ACTIVE_TENANT.handoff.playUrl.replace(/\/$/, "");
-  return `${base}/?class=${encodeURIComponent(gameCode)}&sid=${encodeURIComponent(participantId)}`;
+  return (
+    `${base}/?class=${encodeURIComponent(gameCode)}` +
+    `&sid=${encodeURIComponent(participantId)}` +
+    `&t=${encodeURIComponent(seatToken)}`
+  );
+}
+
+/**
+ * Mint a fresh, short-lived play link for one student in one handed-off session.
+ *
+ * Called on every render of the student's redirect screen, which is what makes a 120s
+ * expiry costless: a student who closes the tab (beergame keeps its session in
+ * sessionStorage, which is per-tab) simply gets a new token when the screen re-mounts.
+ * Nothing is stored — the token is derived, not persisted, so there is no stale credential
+ * sitting in Firestore waiting to be replayed.
+ */
+export function mintSeatLink(gameCode: string, participantId: string): { url: string; expires_in: number } {
+  const token = mintSeatToken(gameCode, participantId, guestSecret());
+  return { url: playLinkFor(gameCode, participantId, token), expires_in: SEAT_TOKEN_TTL_SECONDS };
 }

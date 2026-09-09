@@ -45,7 +45,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -70,6 +70,22 @@ const SECRET_NAME = "PROVISION_SECRET_BEERGAME";
 // because under the v1 set that 500 is a violation, not a baseline. Nobody has to notice.
 const CONTRACT_VERSION = 1;
 
+// ── SEAT TOKENS (spec D2) ─────────────────────────────────────────────────────
+// The harness acts as the MATCHER, so it MINTS. Canonicalisation is duplicated from
+// matcher functions/src/seatToken.ts and beergame functions/src/seatToken.ts on purpose —
+// a third party reimplements this from the contract document, and a harness that imported
+// one side's copy could not catch the two sides drifting apart.
+//   wire:        "<exp>.<hex hmac-sha256>"
+//   signed over: "seat.v1|<gameCode>|<studentId>|<exp>"
+const SEAT_TOKEN_TTL_SECONDS = 120;
+function mintSeatToken(gameCode, studentId, secret, ttl = SEAT_TOKEN_TTL_SECONDS, now = Math.floor(Date.now() / 1000)) {
+  const exp = now + ttl;
+  const mac = createHmac("sha256", secret)
+    .update(`seat.v1|${gameCode}|${studentId}|${exp}`)
+    .digest("hex");
+  return `${exp}.${mac}`;
+}
+
 const EXPECTATIONS = {
   // v0 — the pre-hardening contract, recorded from what production ACTUALLY returned on
   // 2026-09-09 (arc 26 PASS / 0 FAIL, --negative 39 PASS / 0 FAIL, 7 KNOWN-CURRENT).
@@ -80,6 +96,7 @@ const EXPECTATIONS = {
     versionEnforced: false,
     errorShape: "string",          // { error: "unauthorized" }
     badCode: { status: 500, structured: false, code: null, baseline: true },
+    seatTokenEnforced: false,      // overwritten by detectSeatTokenEnforced()
   },
   // v1 — what D7/D8 make true. Nothing here is a baseline; a v1 guest that misses any of
   // it is failing its own declared contract.
@@ -89,6 +106,9 @@ const EXPECTATIONS = {
     versionEnforced: true,
     errorShape: "object",          // { contract_version, error: { code, message } }
     badCode: { status: 400, structured: true, code: "INVALID_GAME_CODE", baseline: false },
+    // ⚠ NOT implied by v1. Pass B stays at contract_version 1, so this is feature-detected
+    // per run and written over this default — see detectSeatTokenEnforced().
+    seatTokenEnforced: false,
   },
 };
 
@@ -112,7 +132,7 @@ const DEFAULTS = {
 
 function parseArgs(argv) {
   const out = { ...DEFAULTS, negative: false, selfTest: false, secretEnv: SECRET_NAME,
-    expectVersion: CONTRACT_VERSION, apiKey: null, apiKeyFile: null, json: false };
+    expectVersion: CONTRACT_VERSION, expectSeatTokens: true, apiKey: null, apiKeyFile: null, json: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     const next = () => argv[(i += 1)];
@@ -120,6 +140,7 @@ function parseArgs(argv) {
     else if (a === "--self-test") out.selfTest = true;
     else if (a === "--secret-env") out.secretEnv = next();
     else if (a === "--expect-version") out.expectVersion = Number(next());
+    else if (a === "--no-expect-seat-tokens") out.expectSeatTokens = false;
     else if (a === "--json") out.json = true;
     else if (a === "--base-url") out.baseUrl = next().replace(/\/$/, "");
     else if (a === "--play-url") out.playUrl = next().replace(/\/$/, "");
@@ -146,6 +167,9 @@ guest-conformance.mjs — conformance harness against the REAL guest endpoints
                         party names his own variable (spec D13).
   --expect-version <n>  contract_version the guest must report (default ${CONTRACT_VERSION}).
                         Pass 0 to run against a pre-D7 guest without failing on it.
+  --no-expect-seat-tokens
+                        allow a guest that does NOT enforce signed seat claims (D2/D3).
+                        Use only to record a pre-pass-B guest; by default that FAILS.
   --base-url <url>      guest functions origin   (default ${DEFAULTS.baseUrl})
   --play-url <url>      guest play origin        (default ${DEFAULTS.playUrl})
   --seats <n>           expected guest seat count (default ${DEFAULTS.seats})
@@ -303,6 +327,28 @@ async function detectContractVersion(baseUrl) {
 }
 
 /**
+ * Is the guest enforcing signed seat claims (D2/D3)?
+ *
+ * ⚠ WHY THIS IS NOT KEYED ON contract_version. Pass B deliberately stays at
+ * contract_version 1 — nothing outside this project has ever spoken the contract, so a bump
+ * now would manufacture version history for revisions nobody used. That means the version
+ * CANNOT select this expectation, and the harness has to feature-detect instead.
+ *
+ * The probe: claim a seat that does not exist, with NO seat token.
+ *   • seat tokens enforced → 400 SEAT_TOKEN_REQUIRED, because verification is pure and runs
+ *     BEFORE any Firestore read;
+ *   • not enforced (pre-pass-B, an onCall) → anything else — 401 from the callable's
+ *     anonymous-auth gate, or a not-found once it reaches the seat lookup.
+ * Using a NONEXISTENT studentId is what makes this safe against a pre-pass-B guest: there,
+ * an unsigned claim still works, and probing a real seat would evict its holder.
+ */
+async function detectSeatTokenEnforced(baseUrl) {
+  const probe = await callGuest(baseUrl, "resumeClassPlayer",
+    { gameCode: "ZZZZZZ", studentId: `seat-token-probe-${Date.now()}` }, null);
+  return probe.status === 400 && probe.json?.error?.code === "SEAT_TOKEN_REQUIRED";
+}
+
+/**
  * Assert an error body in whichever shape the detected version calls for:
  *   v0  { error: "not-found" }
  *   v1  { contract_version: 1, error: { code: "NOT_FOUND", message } }
@@ -434,48 +480,81 @@ async function runArc(opts, secret, expect) {
     deepLink);
   console.log(`        ${deepLink}`);
 
-  // 3. claim the seat (onCall + anonymous auth) ───────────────────────────────────────
-  const apiKey = resolveApiKey(opts);
+  // 3. claim the seat — PLAIN HTTP + SIGNED TOKEN (D2/D3) ────────────────────────────
+  //
+  // ⚠ No Firebase API key any more. D3 removed the onCall wrapper and its anonymous login,
+  // so this endpoint is ordinary HTTP and the harness can exercise it unconditionally. It
+  // used to SKIP whenever no key was supplied — the seat claim, the half of the contract
+  // with the live security defect, was the one part routinely going untested.
   let claimed = null;
-  if (!apiKey) {
-    record(SKIP, "resumeClassPlayer — claim the seat",
-      "no Firebase Web API key. Pass --api-key / --api-key-file / BEERGAME_WEB_API_KEY. " +
-      "This is a SKIP, not a pass: the endpoint was not exercised.");
-  } else {
-    try {
-      const idToken = await anonIdToken(apiKey);
-      const r = await callCallable(opts.baseUrl, "resumeClassPlayer", { gameCode, studentId: target.studentId }, idToken);
-      check("resumeClassPlayer returns 2xx for a provisioned student", r.status >= 200 && r.status < 300,
-        `HTTP ${r.status}: ${r.text.slice(0, 200)}`);
-      claimed = r.result;
-      check("seat payload carries playerId/role/teamId/teamName/name/sessionToken",
-        Boolean(claimed?.playerId && claimed?.role && claimed?.teamId && claimed?.teamName && claimed?.sessionToken),
-        JSON.stringify(claimed ?? {}).slice(0, 200));
-      check("role matches the seat provisioning assigned", claimed?.role === target.role,
-        `provision said '${target.role}', resume said '${claimed?.role}'`);
-      // Documents the PII crossing rather than asserting it away: the name we sent DOES
-      // come back here. That is by design today; §2 of the extract turns on it.
-      check("the display name we sent is returned by resumeClassPlayer (documents the PII crossing)",
-        typeof claimed?.name === "string" && claimed.name.includes(canary),
-        `got name='${claimed?.name}'`);
+  const seatEnforced = expect.seatTokenEnforced;
 
-      // ⚠ The unsigned-sid property, exercised rather than asserted-as-good: a SECOND
-      // anonymous identity, with no relationship to the first, claims the same seat using
-      // only values that travel in a URL. Recorded as a baseline — it is the defect the
-      // hardening pass exists to close, so it must be visible, not silently tolerated.
-      const otherToken = await anonIdToken(apiKey);
-      const hijack = await callCallable(opts.baseUrl, "resumeClassPlayer", { gameCode, studentId: target.studentId }, otherToken);
-      const hijacked = hijack.status >= 200 && hijack.status < 300 && Boolean(hijack.result?.sessionToken);
-      baseline("unrelated anonymous identity can claim the same seat (unsigned sid)",
-        hijacked ? "granted" : "refused", "granted", "refused (sid proven by a signed classroom token)");
-      if (hijacked) {
-        check("…and the hijack minted a DIFFERENT session token (evicting the first holder)",
-          hijack.result.sessionToken !== claimed?.sessionToken,
-          "tokens matched, so no eviction occurred");
-      }
-    } catch (e) {
-      record(FAIL, "resumeClassPlayer — claim the seat", String(e).slice(0, 240));
-    }
+  const goodToken = mintSeatToken(gameCode, target.studentId, secret);
+  const deepLinkSigned = `${opts.playUrl}/?class=${encodeURIComponent(gameCode)}` +
+    `&sid=${encodeURIComponent(target.studentId)}&t=${encodeURIComponent(goodToken)}`;
+  check("deep link carries a signed seat token (t=)", /[?&]t=[0-9]+\.[0-9a-f]{64}/.test(deepLinkSigned),
+    deepLinkSigned.slice(0, 160));
+
+  const claim = await callGuest(opts.baseUrl, "resumeClassPlayer",
+    { gameCode, studentId: target.studentId, seatToken: goodToken }, null);
+  check("resumeClassPlayer accepts a validly signed claim", claim.status >= 200 && claim.status < 300,
+    `HTTP ${claim.status}: ${claim.text.slice(0, 200)}`);
+  claimed = claim.json;
+  check("seat payload carries playerId/role/teamId/teamName/sessionToken",
+    Boolean(claimed?.playerId && claimed?.role && claimed?.teamId && claimed?.teamName && claimed?.sessionToken),
+    JSON.stringify(claimed ?? {}).slice(0, 200));
+  check("role matches the seat provisioning assigned", claimed?.role === target.role,
+    `provision said '${target.role}', claim said '${claimed?.role}'`);
+  if (expect.versionEchoed) {
+    check("seat claim echoes contract_version", claimed?.contract_version === CONTRACT_VERSION,
+      `got ${JSON.stringify(claimed?.contract_version)}`);
+  }
+  check("the display name we sent is returned by the seat claim (documents the PII crossing)",
+    typeof claimed?.name === "string" && claimed.name.includes(canary),
+    `got name='${claimed?.name}'`);
+
+  // ── THE HIJACK PROBE, NOW INVERTED ──────────────────────────────────────────────────
+  //
+  // ⚠ THESE ASSERTIONS USED TO PASS *BECAUSE THE DEFECT EXISTED*. On production on
+  // 2026-09-09 a stranger claimed a live seat with nothing but gameCode+sid, and a second
+  // assertion confirmed the hijack minted a DIFFERENT session token — i.e. that it had
+  // evicted the real holder. Both were evidence of the hole. Inverting them is the point of
+  // this pass: the same three attacks must now be REFUSED, and nothing may be minted.
+  if (!seatEnforced) {
+    baseline("unrelated party can claim the same seat (unsigned sid)", "granted", "granted",
+      "refused (claim proven by a signed seat token)");
+    record(SKIP, "signed-claim refusals (unsigned / expired / wrong-seat)",
+      "guest does not enforce seat tokens yet — pass B not deployed here.");
+  } else {
+    const unsigned = await callGuest(opts.baseUrl, "resumeClassPlayer",
+      { gameCode, studentId: target.studentId }, null);
+    check("UNSIGNED claim on a live seat is REFUSED", unsigned.status === 400 &&
+      unsigned.json?.error?.code === "SEAT_TOKEN_REQUIRED",
+      `HTTP ${unsigned.status}: ${unsigned.text.slice(0, 200)}`);
+
+    const expired = mintSeatToken(gameCode, target.studentId, secret, -60);
+    const expiredRes = await callGuest(opts.baseUrl, "resumeClassPlayer",
+      { gameCode, studentId: target.studentId, seatToken: expired }, null);
+    check("EXPIRED token is REFUSED", expiredRes.status === 401 &&
+      expiredRes.json?.error?.code === "SEAT_TOKEN_EXPIRED",
+      `HTTP ${expiredRes.status}: ${expiredRes.text.slice(0, 200)}`);
+
+    // A token minted for a DIFFERENT seat in the same session — the closest thing to a
+    // realistic forgery, and it must not transfer.
+    const other = seats[1] ?? seats[0];
+    const wrongSeat = mintSeatToken(gameCode, other.studentId, secret);
+    const wrongRes = await callGuest(opts.baseUrl, "resumeClassPlayer",
+      { gameCode, studentId: target.studentId, seatToken: wrongSeat }, null);
+    check("token minted for ANOTHER seat is REFUSED", wrongRes.status === 401 &&
+      wrongRes.json?.error?.code === "SEAT_TOKEN_INVALID",
+      `HTTP ${wrongRes.status}: ${wrongRes.text.slice(0, 200)}`);
+
+    // The inversion of "the hijack minted a DIFFERENT session token". No claim was granted,
+    // so no token may have been minted — that is what "the real holder was not evicted"
+    // looks like from outside.
+    check("no refusal minted a session token (the real holder is not evicted)",
+      !unsigned.json?.sessionToken && !expiredRes.json?.sessionToken && !wrongRes.json?.sessionToken,
+      "a refusal returned a sessionToken — the seat was granted after all");
   }
 
   // 4. finalize, twice — idempotency ──────────────────────────────────────────────────
@@ -728,8 +807,12 @@ async function runSelfTest(opts) {
 
     results.length = 0; // each scenario is judged on its own run
     const detected = await detectContractVersion(baseUrl);
-    const expect = EXPECTATIONS[detected] ?? EXPECTATIONS[0];
-    console.log(`   stub speaks contract_version ${detected} → ${expect.label}`);
+    const seatEnforced = await detectSeatTokenEnforced(baseUrl);
+    const expect = { ...(EXPECTATIONS[detected] ?? EXPECTATIONS[0]), seatTokenEnforced: seatEnforced };
+    console.log(`   stub speaks contract_version ${detected} → ${expect.label}; ` +
+      `seat tokens ${seatEnforced ? "enforced" : "not enforced"}`);
+    check("guest enforces signed seat claims", seatEnforced === opts.expectSeatTokens,
+      `enforced=${seatEnforced}, expected=${opts.expectSeatTokens}.`);
     check(`guest reports contract_version ${opts.expectVersion}`, detected === opts.expectVersion,
       `detected ${detected}.`);
 
@@ -774,14 +857,29 @@ async function main() {
 
   // D7: ask the guest which contract it speaks BEFORE asserting anything about it.
   const detected = await detectContractVersion(opts.baseUrl);
-  const expect = EXPECTATIONS[detected] ?? EXPECTATIONS[0];
+  let expect = EXPECTATIONS[detected] ?? EXPECTATIONS[0];
+  // ⚠ Seat-token enforcement is NOT derivable from contract_version — pass B keeps v1 on
+  // purpose. Feature-detect it and fold it into the expectation set.
+  const seatTokenEnforced = await detectSeatTokenEnforced(opts.baseUrl);
+  expect = { ...expect, seatTokenEnforced };
   console.log(`  guest speaks contract_version ${detected} → ${expect.label}`);
+  console.log(`  signed seat claims (D2/D3): ${seatTokenEnforced ? "ENFORCED" : "NOT enforced"}` +
+    `${seatTokenEnforced ? "" : "  ⚠ the unsigned-sid defect is still open on this guest"}`);
   console.log();
 
   // ⚠ Detection selects the expectation set; it does not excuse a regression. After this
   // pass the guest IS v1, so a guest that has stopped reporting a version is broken, not
   // "legitimately old". --expect-version 0 is how you deliberately run against a pre-D7
   // deploy to record the before-state.
+  // ⚠ Detection selects the expectation set; it must not EXCUSE a regression. A guest that
+  // has stopped enforcing signed claims is broken, not "legitimately old" — the same trap
+  // --expect-version closes for the version, closed here for the seat token. Since pass B
+  // keeps contract_version 1, this guard is the only thing standing between a silent
+  // reversion and a green run.
+  check("guest enforces signed seat claims", seatTokenEnforced === opts.expectSeatTokens,
+    `enforced=${seatTokenEnforced}, expected=${opts.expectSeatTokens}. ` +
+    `If you meant to test a pre-pass-B guest, pass --no-expect-seat-tokens.`);
+
   check(`guest reports contract_version ${opts.expectVersion}`, detected === opts.expectVersion,
     `detected ${detected}. If you meant to test a pre-D7 guest, pass --expect-version ${detected}.`);
 

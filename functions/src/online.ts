@@ -20,6 +20,7 @@ import {
   makeFlagGroup,
   makeGetOnlineReport,
   extractInstructorGameId,
+  extractStudentOnCallIds,
   type OnlineContext,
   type OnlineDefinition,
   type GroupProgress,
@@ -30,9 +31,11 @@ import {
   provisionGroupToTenant,
   finalizeGuestSession,
   getGuestResults,
+  mintSeatLink,
   PROVISION_SECRET,
   type GuestResultPlayer,
 } from "./handoff";
+import { HttpsError } from "firebase-functions/v2/https";
 
 const db = () => admin.firestore();
 
@@ -329,5 +332,50 @@ export const scoreAndRecord = onCall(
       results: { failed: resultsFailed },
       cohort: { teams: teamCosts.length, meanTeamCost: Number(mean.toFixed(2)), stdTeamCost: Number(std.toFixed(2)) },
     };
+  },
+);
+
+/**
+ * getSeatLink — mint this student's short-lived, signed deep link into the guest game.
+ *
+ * D2 put the seat claim behind an HMAC over the shared secret, which means the LINK can no
+ * longer be built in the browser: the matcher frontend used to assemble
+ * `?class=…&sid=…` itself, and a browser must never hold the provisioning secret. So the
+ * redirect screen calls this instead, on every render.
+ *
+ * ⚠ The student is identified by their REAL matcher session (extractStudentOnCallIds —
+ * classroom JWT or Firebase student token), and a token is minted only for the participant
+ * that session resolves to. A student therefore cannot mint a link for someone else's seat,
+ * which is exactly what the unsigned `sid` allowed until today.
+ *
+ * ⚠ Residual limit, stated rather than hidden: this proves "you hold this participant's
+ * matcher session", not "you are this human". That is the same trust level as every other
+ * student callable in the matcher, and a large improvement on a bare query parameter — but
+ * it is not identity proof, and it is not what D2 promises to fix.
+ */
+export const getSeatLink = onCall(
+  { cors: matcherGameDef.corsOrigins, secrets: [PROVISION_SECRET] },
+  async (request: CallableRequest) => {
+    const data = request.data as Record<string, unknown>;
+    const { participantId, gameInstanceId } = await extractStudentOnCallIds(
+      data,
+      process.env.FUNCTIONS_EMULATOR === "true",
+      request.rawRequest.headers.authorization as string | undefined,
+    );
+
+    const groupsSnap = await db()
+      .collection("game_instances").doc(gameInstanceId).collection("groups").get();
+    const mine = groupsSnap.docs.find((doc) => {
+      const g = doc.data() as Record<string, unknown>;
+      const seats = Array.isArray(g["player_participants"]) ? (g["player_participants"] as string[]) : [];
+      return seats.includes(participantId);
+    });
+    if (!mine) throw new HttpsError("not-found", "You are not in a group yet.");
+
+    const gameCode = (mine.data() as Record<string, unknown>)["gameCode"];
+    if (typeof gameCode !== "string" || !gameCode) {
+      throw new HttpsError("failed-precondition", "Your group has not been started yet.");
+    }
+    return mintSeatLink(gameCode, participantId);
   },
 );

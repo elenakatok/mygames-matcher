@@ -67,6 +67,7 @@ export {
   startAllGroups,
   getOnlineReport,
   scoreAndRecord,
+  getSeatLink,
 } from "./online";
 
 // ── health ─────────────────────────────────────────────────────────────────────

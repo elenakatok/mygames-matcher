@@ -19,6 +19,8 @@
 //                3. drops the last member      → the seat-coverage check must go red
 //   no-version otherwise correct, but never emits contract_version
 //                                              → "guest reports contract_version 1" red
+//   accepts-unsigned  grants a seat with no token at all
+//   accepts-expired   verifies the signature but ignores `exp`
 //   lying-v1   reports contract_version 1 but still answers a bad game code with an
 //              unstructured 500 — the exact pre-D8 behaviour production had on 2026-09-09
 //                                              → the v1 bad-code checks must go red
@@ -28,9 +30,11 @@
 // has DECLARED it implements D8, so the same 500 is a violation and fails on its own.
 
 import http from "node:http";
+import * as crypto from "node:crypto";
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
 const CONTRACT_VERSION = 1;
+const SEAT_SECRET_UNUSED_BY_LAX_VARIANTS = null; // documents that laxity is the defect
 
 /** The secret the self-test presents. Not a credential — these stubs are local and fake. */
 export const SELFTEST_SECRET = "selftest-secret-not-a-credential";
@@ -58,7 +62,11 @@ function makeServer(variant) {
 
       // DEFECT 1 (classic): any Authorization header is accepted, including a wrong secret.
       // The real guest compares with crypto.timingSafeEqual and 401s.
-      if (variant !== "classic") {
+      // ⚠ resumeClassPlayer has NO Authorization header — D3 made the signed seat token the
+      // whole credential, so the student never carries the shared secret. Gating it on a
+      // bearer would 401 the very endpoint these scenarios exist to probe.
+      const isSeatClaim = url.endsWith("/resumeClassPlayer");
+      if (variant !== "classic" && !isSeatClaim) {
         // ⚠ Accept the self-test's own secret and reject ONLY the harness's deliberate
         // wrong one. Rejecting everything would 401 the whole suite, and each scenario's
         // expected failure would then fire for the wrong reason — a vacuous proof, which
@@ -145,6 +153,42 @@ function makeServer(variant) {
         return send(200, body({ ok: true, gameCode: code, teams, players }));
       }
 
+      if (url.endsWith("/resumeClassPlayer")) {
+        const code = String(parsed?.gameCode ?? "").trim().toUpperCase();
+        const studentId = String(parsed?.studentId ?? "").trim();
+        const seatToken = parsed?.seatToken;
+        if (!studentId) return sendErr(400, "STUDENT_ID_REQUIRED", "studentId is required.");
+
+        // DEFECT 5 (accepts-unsigned): grants a seat with NO token at all — the exact
+        // production behaviour of 2026-09-09, where a stranger took a live seat with
+        // nothing but gameCode+sid.
+        // DEFECT 6 (accepts-expired): checks the signature but ignores `exp`, so a token
+        // scraped from browser history keeps working indefinitely.
+        if (variant !== "accepts-unsigned") {
+          if (typeof seatToken !== "string" || !seatToken) {
+            return sendErr(400, "SEAT_TOKEN_REQUIRED", "A signed seat token is required.");
+          }
+          const dot = seatToken.indexOf(".");
+          const exp = Number(seatToken.slice(0, dot));
+          const mac = seatToken.slice(dot + 1);
+          const want = crypto.createHmac("sha256", SELFTEST_SECRET)
+            .update(`seat.v1|${code}|${studentId}|${exp}`).digest("hex");
+          if (mac !== want) return sendErr(401, "SEAT_TOKEN_INVALID", "Signature does not match.");
+          if (variant !== "accepts-expired" && exp <= Math.floor(Date.now() / 1000)) {
+            return sendErr(401, "SEAT_TOKEN_EXPIRED", "Seat token has expired.");
+          }
+        }
+
+        const s2 = sessions.get(code);
+        const seat = s2?.seats.find((x) => x.studentId === studentId);
+        if (!seat) return sendErr(404, "SEAT_NOT_FOUND", "No seat for this student.");
+        return send(200, body({
+          playerId: seat.playerId, role: seat.role, teamId: seat.teamId,
+          teamName: "Selftest Team", name: `Selftest ${studentId}`,
+          sessionToken: crypto.randomBytes(12).toString("hex"),
+        }));
+      }
+
       return sendErr(404, "NOT_FOUND", "Unknown endpoint.");
     });
   });
@@ -181,6 +225,23 @@ export const SELFTEST_SCENARIOS = [
     what: "D7: a guest that never reports contract_version",
     expectedFailures: [
       "guest reports contract_version 1",
+    ],
+  },
+  {
+    variant: "accepts-unsigned",
+    what: "D2: a guest that grants a seat with NO signed token (the 2026-09-09 defect)",
+    expectedFailures: [
+      // A guest that grants unsigned claims correctly DETECTS as "not enforced", so the
+      // refusal assertions never run. What must go red is the enforcement guard itself —
+      // exactly as --expect-version catches a guest that stopped reporting a version.
+      "guest enforces signed seat claims",
+    ],
+  },
+  {
+    variant: "accepts-expired",
+    what: "D2: a guest that verifies the signature but ignores the expiry",
+    expectedFailures: [
+      "EXPIRED token is REFUSED",
     ],
   },
   {
