@@ -198,8 +198,20 @@ function record(status, name, detail = "") {
 const check = (name, cond, detail = "") => record(cond ? PASS : FAIL, name, cond ? "" : detail);
 
 /** Behaviour that is WRONG today. Records a baseline; shouts if it has moved. */
+// ⚠ Baselines describe the REAL guest's current behaviour. Against the deliberately broken
+// self-test stub they are meaningless — it does not validate game codes or filter members,
+// so it "moves" baselines it was never measured against. Evaluating them there produced two
+// spurious BASELINE MOVED lines, which is worse than useless: BASELINE MOVED is the signal
+// that has to stay trustworthy when hardening lands, and a check that cries wolf during the
+// instrument proof teaches the reader to scroll past exactly the line that will matter.
+let baselinesApply = true;
+const setBaselinesApply = (v) => { baselinesApply = v; };
+
 function baseline(name, observed, knownCurrent, wanted) {
-  if (observed === knownCurrent) {
+  if (!baselinesApply) {
+    record(SKIP, name, `baseline not evaluated against the self-test stub (observed ${observed}); ` +
+      `baselines describe the real guest only.`);
+  } else if (observed === knownCurrent) {
     record(BASELINE, name, `observed ${observed} (known-current). Hardening should make this ${wanted}.`);
   } else {
     record(MOVED, name, `observed ${observed}, baseline was ${knownCurrent}, target is ${wanted}. ` +
@@ -571,6 +583,7 @@ async function runSelfTest(opts) {
   console.log(`  lines may also read oddly — judge this run by the INSTRUMENT PROOF block.`);
   console.log();
 
+  setBaselinesApply(false); // see baseline(): the stub is not the guest they were measured on
   const stubOpts = { ...opts, baseUrl, playUrl: "http://127.0.0.1:0", negative: true, apiKey: null, apiKeyFile: null };
   await runArc(stubOpts, "any-secret-is-accepted-by-the-stub");
   await runNegative(stubOpts, "any-secret-is-accepted-by-the-stub");
