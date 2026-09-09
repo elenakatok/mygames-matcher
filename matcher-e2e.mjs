@@ -97,7 +97,7 @@ function mockResultsFor(code) {
     individualCost: Math.round(teamCost / 4) + i * 10,
     participated: true,
   }))
-  return { ok: true, gameCode: code, teams: [{ teamId: 'team1', teamName: `Mock Team ${suffix}`, teamCost }], players }
+  return { contract_version: 1, ok: true, gameCode: code, teams: [{ teamId: 'team1', teamName: `Mock Team ${suffix}`, teamCost }], players }
 }
 const ROSTER = [
   { participant_id: 'stu1', name: 'Ada Lovelace',    email: 'ada@example.edu',   external_id: 'stu1' },
@@ -123,7 +123,7 @@ function startClassroom() {
           provisionRequests.push(parsed)
           const code = `BEER${String(nextGameCode++).padStart(3, '0')}`
           membersByCode[code] = parsed?.groups?.[0]?.members ?? []
-          r.end(JSON.stringify({ gameCode: code })); return
+          r.end(JSON.stringify({ contract_version: 1, gameCode: code })); return
         }
         // /results — the matcher reads a session's team + player costs (Beer Game getClassResults).
         if (url.endsWith('/results')) {
@@ -133,12 +133,12 @@ function startClassroom() {
         // /finalize — end a session, ack ended.
         if (url.endsWith('/finalize')) {
           finalizeRequests.push(parsed?.gameCode)
-          r.end(JSON.stringify({ ok: true })); return
+          r.end(JSON.stringify({ contract_version: 1, ok: true })); return
         }
         // /game-results — the MATCHER's gradebook push (one row per human student).
         if (url.endsWith('/game-results')) {
           gradePushes.push(parsed)
-          r.end(JSON.stringify({ ok: true })); return
+          r.end(JSON.stringify({ contract_version: 1, ok: true })); return
         }
         // Otherwise it is a roster pull.
         rosterRequests++

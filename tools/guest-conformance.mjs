@@ -57,6 +57,50 @@ const MATCHER_ROOT = join(HERE, "..");
 const MATCHER_PROJECT = "matcher-mygames-live";
 const SECRET_NAME = "PROVISION_SECRET_BEERGAME";
 
+// ── CONTRACT VERSION + VERSION-KEYED EXPECTATIONS (spec D7/D8) ────────────────────────
+//
+// ⚠ WHY THIS REPLACED HARDCODED BASELINES. Until D7 there was nothing to ask the guest
+// about itself, so today's wrong behaviours were pinned as literals (`500`) that a human
+// had to remember to edit when hardening landed. A structural fix beats a discipline fix:
+// the harness now READS the guest's contract_version and selects the matching expectation
+// set. The payoff is the case a hardcoded baseline cannot catch —
+//
+//     a guest reporting v1 while still returning unstructured 500s FAILS ON ITS OWN,
+//
+// because under the v1 set that 500 is a violation, not a baseline. Nobody has to notice.
+const CONTRACT_VERSION = 1;
+
+const EXPECTATIONS = {
+  // v0 — the pre-hardening contract, recorded from what production ACTUALLY returned on
+  // 2026-09-09 (arc 26 PASS / 0 FAIL, --negative 39 PASS / 0 FAIL, 7 KNOWN-CURRENT).
+  // These are baselines: wrong, known, and not this harness's business to fail on.
+  0: {
+    label: "v0 (pre-D7/D8, as production returned on 2026-09-09)",
+    versionEchoed: false,
+    versionEnforced: false,
+    errorShape: "string",          // { error: "unauthorized" }
+    badCode: { status: 500, structured: false, code: null, baseline: true },
+  },
+  // v1 — what D7/D8 make true. Nothing here is a baseline; a v1 guest that misses any of
+  // it is failing its own declared contract.
+  1: {
+    label: "v1 (D7 contract_version + D8 structured errors)",
+    versionEchoed: true,
+    versionEnforced: true,
+    errorShape: "object",          // { contract_version, error: { code, message } }
+    badCode: { status: 400, structured: true, code: "INVALID_GAME_CODE", baseline: false },
+  },
+};
+
+/** v0 error string → v1 stable code, so one assertion covers both shapes. */
+const ERROR_CODE_FOR = {
+  "unauthorized": "UNAUTHORIZED",
+  "method-not-allowed": "METHOD_NOT_ALLOWED",
+  "groups[] is required": "GROUPS_REQUIRED",
+  "not-found": "NOT_FOUND",
+  "not-a-classroom-session": "NOT_A_CLASSROOM_SESSION",
+};
+
 const DEFAULTS = {
   baseUrl: "https://us-central1-beergame-mygames-live.cloudfunctions.net",
   playUrl: "https://beergame-mygames-live.web.app",
@@ -68,13 +112,14 @@ const DEFAULTS = {
 
 function parseArgs(argv) {
   const out = { ...DEFAULTS, negative: false, selfTest: false, secretEnv: SECRET_NAME,
-    apiKey: null, apiKeyFile: null, json: false };
+    expectVersion: CONTRACT_VERSION, apiKey: null, apiKeyFile: null, json: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     const next = () => argv[(i += 1)];
     if (a === "--negative") out.negative = true;
     else if (a === "--self-test") out.selfTest = true;
     else if (a === "--secret-env") out.secretEnv = next();
+    else if (a === "--expect-version") out.expectVersion = Number(next());
     else if (a === "--json") out.json = true;
     else if (a === "--base-url") out.baseUrl = next().replace(/\/$/, "");
     else if (a === "--play-url") out.playUrl = next().replace(/\/$/, "");
@@ -99,6 +144,8 @@ guest-conformance.mjs — conformance harness against the REAL guest endpoints
   --secret-env <NAME>   env var holding the shared secret (default ${SECRET_NAME}).
                         The contract specifies the HEADER, not the storage — a third
                         party names his own variable (spec D13).
+  --expect-version <n>  contract_version the guest must report (default ${CONTRACT_VERSION}).
+                        Pass 0 to run against a pre-D7 guest without failing on it.
   --base-url <url>      guest functions origin   (default ${DEFAULTS.baseUrl})
   --play-url <url>      guest play origin        (default ${DEFAULTS.playUrl})
   --seats <n>           expected guest seat count (default ${DEFAULTS.seats})
@@ -221,18 +268,59 @@ function baseline(name, observed, knownCurrent, wanted) {
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────────────
 
-async function callGuest(baseUrl, fn, body, secret, { method = "POST" } = {}) {
+/**
+ * D7: every matcher→guest request carries contract_version. Pass `version: null` to OMIT it
+ * (the negative suite needs to send an unversioned request) or a number to send a wrong one.
+ */
+async function callGuest(baseUrl, fn, body, secret, { method = "POST", version = CONTRACT_VERSION } = {}) {
   const headers = { "Content-Type": "application/json" };
   if (secret !== null) headers.Authorization = `Bearer ${secret}`;
+  const payload = version === null ? { ...(body ?? {}) } : { contract_version: version, ...(body ?? {}) };
   const res = await fetch(`${baseUrl}/${fn}`, {
     method,
     headers,
-    body: method === "GET" ? undefined : JSON.stringify(body ?? {}),
+    body: method === "GET" ? undefined : JSON.stringify(payload),
   });
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch { /* non-JSON is itself a finding */ }
   return { status: res.status, json, text, isJson: json !== null };
+}
+
+/**
+ * Ask the guest which contract it speaks, WITHOUT creating anything.
+ *
+ * The probe is a deliberately-wrong-secret call: it is rejected at the auth gate, so no
+ * session is provisioned and no document is written — but a v1 guest still echoes
+ * contract_version in that 401 body, because D8 requires the version on every response
+ * including errors. A guest that echoes nothing is treated as v0.
+ */
+async function detectContractVersion(baseUrl) {
+  const probe = await callGuest(baseUrl, "provisionClassSession", { groups: [] },
+    "version-probe-not-a-real-secret");
+  const v = probe.json?.contract_version;
+  return Number.isInteger(v) ? Number(v) : 0;
+}
+
+/**
+ * Assert an error body in whichever shape the detected version calls for:
+ *   v0  { error: "not-found" }
+ *   v1  { contract_version: 1, error: { code: "NOT_FOUND", message } }
+ * One call site, two contracts, so the negative suite reads the same either way.
+ */
+function checkErrorBody(name, res, v0String, expect) {
+  const wantCode = ERROR_CODE_FOR[v0String] ?? v0String;
+  if (expect.errorShape === "string") {
+    check(`${name} (v0 shape {error:'${v0String}'})`, res.json?.error === v0String,
+      `got ${JSON.stringify(res.json).slice(0, 160)}`);
+    return;
+  }
+  check(`${name} (v1 shape {error:{code:'${wantCode}'}})`,
+    res.json?.error?.code === wantCode && typeof res.json?.error?.message === "string",
+    `got ${JSON.stringify(res.json).slice(0, 160)}`);
+  check(`${name} — error body echoes contract_version`,
+    res.json?.contract_version === CONTRACT_VERSION,
+    `got contract_version=${JSON.stringify(res.json?.contract_version)}`);
 }
 
 /**
@@ -280,7 +368,7 @@ function resolveApiKey(opts) {
 
 // ── the happy-path arc ────────────────────────────────────────────────────────────────
 
-async function runArc(opts, secret) {
+async function runArc(opts, secret, expect) {
   const stamp = Date.now();
   const instanceId = `conformance-${stamp}`;
   const groupId = `cgroup-${stamp}`;
@@ -311,6 +399,12 @@ async function runArc(opts, secret) {
   // ⚠ The real regex, from the contract — NOT the mock's BEER001 shape, which this
   // pattern rejects. If matcher-e2e's mock were driving this, the next line would fail.
   check("gameCode matches the real /^[A-Z2-9]{4,8}$/", /^[A-Z2-9]{4,8}$/.test(gameCode), `got '${gameCode}'`);
+
+  // D7: "Echoed in every response." Success bodies too, not only errors.
+  if (expect.versionEchoed) {
+    check("provision response echoes contract_version", prov.json?.contract_version === CONTRACT_VERSION,
+      `got contract_version=${JSON.stringify(prov.json?.contract_version)}`);
+  }
 
   const seats = Array.isArray(prov.json.seats) ? prov.json.seats : [];
   check("seats[] returned, one per member", seats.length === members.length, `got ${seats.length}, sent ${members.length}`);
@@ -395,6 +489,11 @@ async function runArc(opts, secret) {
   check("finalize #2 returns 2xx (idempotent)", fin2.status >= 200 && fin2.status < 300, `HTTP ${fin2.status}`);
   check("finalize #2 returns ok:true, alreadyEnded:true",
     fin2.json?.ok === true && fin2.json?.alreadyEnded === true, JSON.stringify(fin2.json));
+  if (expect.versionEchoed) {
+    check("finalize responses echo contract_version",
+      fin1.json?.contract_version === CONTRACT_VERSION && fin2.json?.contract_version === CONTRACT_VERSION,
+      `#1=${JSON.stringify(fin1.json?.contract_version)} #2=${JSON.stringify(fin2.json?.contract_version)}`);
+  }
 
   // ⚠ HONEST LIMIT. "Does not re-fire grading" is NOT observable over HTTP — the grade
   // push is a Firestore onDocumentWritten trigger inside the guest project. What is
@@ -410,6 +509,10 @@ async function runArc(opts, secret) {
   // 5. results ────────────────────────────────────────────────────────────────────────
   const rr = await callGuest(opts.baseUrl, "getClassResults", { gameCode }, secret);
   check("getClassResults returns 2xx", rr.status >= 200 && rr.status < 300, `HTTP ${rr.status}: ${rr.text.slice(0, 200)}`);
+  if (expect.versionEchoed) {
+    check("results response echoes contract_version", rr.json?.contract_version === CONTRACT_VERSION,
+      `got contract_version=${JSON.stringify(rr.json?.contract_version)}`);
+  }
   check("results carry ok/gameCode/teams[]/players[]",
     rr.json?.ok === true && rr.json?.gameCode === gameCode && Array.isArray(rr.json?.teams) && Array.isArray(rr.json?.players),
     JSON.stringify(rr.json).slice(0, 200));
@@ -443,38 +546,74 @@ async function runArc(opts, secret) {
 
 // ── the negative suite — this matters more than the happy path ────────────────────────
 
-async function runNegative(opts, secret) {
+async function runNegative(opts, secret, expect) {
   console.log(`\n── NEGATIVE ── deliberate failures; each must be DETECTED\n`);
 
   // 1. wrong secret → 401
   const wrong = await callGuest(opts.baseUrl, "provisionClassSession",
     { groups: [{ members: [{ studentId: "x" }] }] }, "definitely-not-the-secret");
   check("wrong secret → 401", wrong.status === 401, `got HTTP ${wrong.status}: ${wrong.text.slice(0, 160)}`);
-  check("401 body is {error:'unauthorized'}", wrong.json?.error === "unauthorized", wrong.text.slice(0, 160));
+  checkErrorBody("401 body", wrong, "unauthorized", expect);
 
   // 2. non-POST → 405
   const get = await callGuest(opts.baseUrl, "provisionClassSession", null, secret, { method: "GET" });
   check("non-POST → 405", get.status === 405, `got HTTP ${get.status}: ${get.text.slice(0, 160)}`);
-  check("405 body is {error:'method-not-allowed'}", get.json?.error === "method-not-allowed", get.text.slice(0, 160));
+  checkErrorBody("405 body", get, "method-not-allowed", expect);
 
   // 3. empty groups[] → 400
   const empty = await callGuest(opts.baseUrl, "provisionClassSession", { groups: [] }, secret);
   check("empty groups[] → 400", empty.status === 400, `got HTTP ${empty.status}: ${empty.text.slice(0, 160)}`);
-  check("400 body is {error:'groups[] is required'}", empty.json?.error === "groups[] is required", empty.text.slice(0, 160));
+  checkErrorBody("400 body", empty, "groups[] is required", expect);
 
   // 4. game code containing 0/1 → KNOWN-CURRENT 500 (parseGameCode throws HttpsError
   //    inside an onRequest, so it escapes as an unstructured 500 rather than a 400).
   //    We record what we OBSERVE, not the status we wish for.
   const bad = await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: "BEER01" }, secret);
-  baseline("game code containing 0/1 ('BEER01')", bad.status, 500, 400);
-  record(BASELINE, "…and its body is unstructured",
-    `isJson=${bad.isJson} body='${bad.text.slice(0, 120).replace(/\n/g, " ")}'`);
+  if (expect.badCode.baseline) {
+    // v0: an HttpsError escaping an onRequest. Wrong, known, and not ours to fail on yet.
+    baseline("game code containing 0/1 ('BEER01')", bad.status, expect.badCode.status, 400);
+    record(BASELINE, "…and its body is unstructured",
+      `isJson=${bad.isJson} body='${bad.text.slice(0, 120).replace(/\n/g, " ")}'`);
+  } else {
+    // v1: the guest SAYS it implements D8, so this is a violation, not a baseline. This is
+    // the case a hardcoded baseline could never catch — no human has to remember anything.
+    check(`game code containing 0/1 ('BEER01') → ${expect.badCode.status}`,
+      bad.status === expect.badCode.status,
+      `guest reports contract_version ${CONTRACT_VERSION} but returned HTTP ${bad.status}: ` +
+      `${bad.text.slice(0, 160)}`);
+    check("…and its body is structured JSON with a stable code",
+      bad.isJson && bad.json?.error?.code === expect.badCode.code,
+      `isJson=${bad.isJson} body='${bad.text.slice(0, 160).replace(/\n/g, " ")}' ` +
+      `(expected error.code='${expect.badCode.code}')`);
+  }
+
+  // D7 enforcement — only meaningful against a guest that claims to implement it.
+  if (expect.versionEnforced) {
+    const noVer = await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: "ZZZZZZ" },
+      secret, { version: null });
+    check("request with NO contract_version → 400", noVer.status === 400,
+      `got HTTP ${noVer.status}: ${noVer.text.slice(0, 160)}`);
+    check("…with code CONTRACT_VERSION_REQUIRED",
+      noVer.json?.error?.code === "CONTRACT_VERSION_REQUIRED",
+      `got ${JSON.stringify(noVer.json).slice(0, 160)}`);
+
+    const badVer = await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: "ZZZZZZ" },
+      secret, { version: 999 });
+    check("request with an unknown major (999) → 400", badVer.status === 400,
+      `got HTTP ${badVer.status}: ${badVer.text.slice(0, 160)}`);
+    check("…with code UNSUPPORTED_CONTRACT_VERSION",
+      badVer.json?.error?.code === "UNSUPPORTED_CONTRACT_VERSION",
+      `got ${JSON.stringify(badVer.json).slice(0, 160)}`);
+  } else {
+    record(SKIP, "contract_version enforcement",
+      "guest does not report a contract_version, so D7 is not implemented there yet.");
+  }
 
   // 5. unknown but WELL-FORMED game code → 404
   const unknown = "ZZZZZZ"; // legal charset, vanishingly unlikely to exist
   const nf = await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: unknown }, secret);
   check("unknown well-formed game code → 404", nf.status === 404, `got HTTP ${nf.status}: ${nf.text.slice(0, 160)}`);
-  check("404 body is {error:'not-found'}", nf.json?.error === "not-found", nf.text.slice(0, 160));
+  checkErrorBody("404 body", nf, "not-found", expect);
 
   // 6. finalize on a code never provisioned → 404 (same shape; asserted separately
   //    because the brief calls it out as its own case, and a future implementation
@@ -571,34 +710,51 @@ async function runNegative(opts, secret) {
  * stamp — both are reported as a broken instrument, and both exit non-zero.
  */
 async function runSelfTest(opts) {
-  const { startSelfTestStub, EXPECTED_FAILURES } = await import("./selftest-stub.mjs");
-  const { server, baseUrl } = await startSelfTestStub();
+  const { startSelfTestStub, SELFTEST_SCENARIOS, SELFTEST_SECRET } = await import("./selftest-stub.mjs");
 
   console.log("guest-conformance --self-test — PROVING THE INSTRUMENT");
-  console.log(`  target      ${baseUrl}  (shipped, deliberately broken guest)`);
   console.log(`  ⚠ this proves the HARNESS bites. It says nothing about any real guest.`);
-  console.log(`  expecting these to go RED:`);
-  for (const n of EXPECTED_FAILURES) console.log(`      - ${n}`);
-  console.log(`  Only those three constitute the proof. The stub is a broken guest, so other`);
-  console.log(`  lines may also read oddly — judge this run by the INSTRUMENT PROOF block.`);
-  console.log();
+  console.log(`  ${SELFTEST_SCENARIOS.length} scenarios; the defects are mutually exclusive, so each`);
+  console.log(`  gets its own run. Judge this by the INSTRUMENT PROOF block at the end.`);
 
   setBaselinesApply(false); // see baseline(): the stub is not the guest they were measured on
-  const stubOpts = { ...opts, baseUrl, playUrl: "http://127.0.0.1:0", negative: true, apiKey: null, apiKeyFile: null };
-  await runArc(stubOpts, "any-secret-is-accepted-by-the-stub");
-  await runNegative(stubOpts, "any-secret-is-accepted-by-the-stub");
-  server.close();
+  let broken = 0;
+  const verdicts = [];
+
+  for (const sc of SELFTEST_SCENARIOS) {
+    const { server, baseUrl } = await startSelfTestStub(sc.variant);
+    console.log(`\n══ SCENARIO '${sc.variant}' — ${sc.what}`);
+    console.log(`   expecting RED: ${sc.expectedFailures.join(" | ")}\n`);
+
+    results.length = 0; // each scenario is judged on its own run
+    const detected = await detectContractVersion(baseUrl);
+    const expect = EXPECTATIONS[detected] ?? EXPECTATIONS[0];
+    console.log(`   stub speaks contract_version ${detected} → ${expect.label}`);
+    check(`guest reports contract_version ${opts.expectVersion}`, detected === opts.expectVersion,
+      `detected ${detected}.`);
+
+    const stubOpts = { ...opts, baseUrl, playUrl: "http://127.0.0.1:0", negative: true,
+      apiKey: null, apiKeyFile: null };
+    await runArc(stubOpts, SELFTEST_SECRET, expect);
+    await runNegative(stubOpts, SELFTEST_SECRET, expect);
+    server.close();
+
+    for (const name of sc.expectedFailures) {
+      const hit = results.find((r) => r.name === name);
+      if (!hit) { verdicts.push([sc.variant, name, "MISSING", "assertion renamed or removed; proof is void"]); broken += 1; }
+      else if (hit.status === FAIL) verdicts.push([sc.variant, name, "BIT", "went red as required"]);
+      else { verdicts.push([sc.variant, name, "BLIND", `returned ${hit.status}; the harness is not reading this`]); broken += 1; }
+    }
+  }
 
   console.log(`\n── INSTRUMENT PROOF ──`);
-  let broken = 0;
-  for (const name of EXPECTED_FAILURES) {
-    const hit = results.find((r) => r.name === name);
-    if (!hit) { console.log(`  ✗ MISSING   '${name}' — assertion renamed or removed; proof is void`); broken += 1; }
-    else if (hit.status === FAIL) console.log(`  ✓ BIT       '${name}' went red as required`);
-    else { console.log(`  ✗ BLIND     '${name}' returned ${hit.status}; the harness is not reading this`); broken += 1; }
+  for (const [variant, name, verdict, why] of verdicts) {
+    const mark = verdict === "BIT" ? "✓" : "✗";
+    console.log(`  ${mark} ${verdict.padEnd(8)} [${variant}] '${name}' — ${why}`);
   }
+  const total = verdicts.length;
   console.log(broken === 0
-    ? `\n  ✅ Instrument proved: ${EXPECTED_FAILURES.length}/${EXPECTED_FAILURES.length} planted defects detected.`
+    ? `\n  ✅ Instrument proved: ${total}/${total} planted defects detected across ${SELFTEST_SCENARIOS.length} scenarios.`
     : `\n  ❌ Instrument NOT proved: ${broken} problem(s) above. Do not trust a green run.`);
   process.exit(broken === 0 ? 0 : 1);
 }
@@ -616,8 +772,21 @@ async function main() {
   console.log(`  fingerprint sha256:${fingerprint(secret)}  (value never printed)`);
   console.log(`  mode        ${opts.negative ? "arc + negative" : "arc only (add --negative)"}`);
 
-  const arc = await runArc(opts, secret);
-  const neg = opts.negative ? await runNegative(opts, secret) : {};
+  // D7: ask the guest which contract it speaks BEFORE asserting anything about it.
+  const detected = await detectContractVersion(opts.baseUrl);
+  const expect = EXPECTATIONS[detected] ?? EXPECTATIONS[0];
+  console.log(`  guest speaks contract_version ${detected} → ${expect.label}`);
+  console.log();
+
+  // ⚠ Detection selects the expectation set; it does not excuse a regression. After this
+  // pass the guest IS v1, so a guest that has stopped reporting a version is broken, not
+  // "legitimately old". --expect-version 0 is how you deliberately run against a pre-D7
+  // deploy to record the before-state.
+  check(`guest reports contract_version ${opts.expectVersion}`, detected === opts.expectVersion,
+    `detected ${detected}. If you meant to test a pre-D7 guest, pass --expect-version ${detected}.`);
+
+  const arc = await runArc(opts, secret, expect);
+  const neg = opts.negative ? await runNegative(opts, secret, expect) : {};
 
   // ── summary ─────────────────────────────────────────────────────────────────────────
   const count = (s) => results.filter((r) => r.status === s).length;

@@ -20,6 +20,38 @@ import { ACTIVE_TENANT } from "./tenants";
 // Single-tenant deploy: the provisioning secret name is fixed per deployment.
 export const PROVISION_SECRET = defineSecret(ACTIVE_TENANT.handoff.secretName);
 
+// ── CONTRACT v1 (spec D7) ─────────────────────────────────────────────────────
+//
+// D7 — "Every matcher→guest request carries contract_version, and the guest rejects an
+// unknown major. Echoed in every response. Starts at 1. Without this, the first divergence
+// between Kyle's implementation and ours surfaces as mysterious runtime behaviour rather
+// than a named error."
+//
+// ⚠ D1: no compatibility shim. This matcher cannot talk to an unversioned guest and does
+// not try — a guest that does not echo the version is a deploy-order mistake, and the
+// point of D7 is that it says so by name instead of failing somewhere downstream.
+export const CONTRACT_VERSION = 1;
+
+/**
+ * Assert the guest echoed a version we speak. The whole value of D7 is that a mismatch is
+ * named HERE, at the boundary, rather than surfacing later as an odd-shaped payload or a
+ * class that silently grades wrong.
+ */
+function assertGuestVersion(fn: string, parsed: unknown): void {
+  const v = (parsed as Record<string, unknown> | null)?.["contract_version"];
+  if (v === undefined || v === null) {
+    throw new Error(
+      `${fn}: guest returned no contract_version. This matcher speaks v${CONTRACT_VERSION}; ` +
+      `the guest is either pre-D7 or not deployed yet. Both sides must land together.`,
+    );
+  }
+  if (Number(v) !== CONTRACT_VERSION) {
+    throw new Error(
+      `${fn}: guest speaks contract_version ${String(v)}, this matcher speaks ${CONTRACT_VERSION}.`,
+    );
+  }
+}
+
 const db = () => admin.firestore();
 
 /**
@@ -49,11 +81,12 @@ export async function finalizeGuestSession(gameCode: string): Promise<void> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${guestSecret()}` },
-    body: JSON.stringify({ gameCode }),
+    body: JSON.stringify({ contract_version: CONTRACT_VERSION, gameCode }),
   });
   if (!(res.status >= 200 && res.status < 300)) {
     throw new Error(`finalize failed for ${gameCode}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   }
+  assertGuestVersion("finalizeGuestSession", await res.json().catch(() => null));
 }
 
 /** One human player's costs, as reported by the guest game's results endpoint. */
@@ -85,12 +118,13 @@ export async function getGuestResults(gameCode: string): Promise<GuestResults> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${guestSecret()}` },
-    body: JSON.stringify({ gameCode }),
+    body: JSON.stringify({ contract_version: CONTRACT_VERSION, gameCode }),
   });
   if (!(res.status >= 200 && res.status < 300)) {
     throw new Error(`results failed for ${gameCode}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   }
   const out = (await res.json()) as Partial<GuestResults>;
+  assertGuestVersion("getGuestResults", out);
   return {
     gameCode,
     teams: Array.isArray(out.teams) ? out.teams : [],
@@ -142,12 +176,18 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
       "Content-Type": "application/json",
       Authorization: `Bearer ${guestSecret()}`,
     },
-    body: JSON.stringify({ instanceId: iid, groups: [{ groupId, members }], config }),
+    body: JSON.stringify({
+      contract_version: CONTRACT_VERSION,
+      instanceId: iid,
+      groups: [{ groupId, members }],
+      config,
+    }),
   });
   if (!(res.status >= 200 && res.status < 300)) {
     throw new Error(`hand-off failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   }
   const out = (await res.json()) as { gameCode?: string };
+  assertGuestVersion("provisionGroupToTenant", out);
   if (!out.gameCode) throw new Error("hand-off returned no gameCode");
 
   // ⚠ `seats_locked_at` is what the STAGE ADAPTER reads for "this group has started"
