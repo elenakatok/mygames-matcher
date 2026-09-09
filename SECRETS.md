@@ -34,6 +34,16 @@ a permanent 403.
 bytes, different labels. Anything acting as the matcher — including
 `tools/guest-conformance.mjs` — needs the **matcher's** copy.
 
+Per hardening-spec **D13** this divergence is deliberate and documented rather than
+unified: *"A third party names his own environment variable; the contract specifies the
+header, not the storage."* The harness therefore takes `--secret-env <NAME>`, so a
+third-party developer supplies the secret under whatever name he uses, with none of the
+gcloud/`.secret.local` machinery above:
+
+```bash
+SHARED_SECRET=... node tools/guest-conformance.mjs --secret-env SHARED_SECRET --base-url https://his-endpoints.example.com
+```
+
 Prerequisites: Secret Manager API enabled on `matcher-mygames-live`, and gcloud
 authenticated with access to all three projects. The script does not enable APIs or grant
 IAM. It exits 3 if a source secret is missing rather than copying nothing.

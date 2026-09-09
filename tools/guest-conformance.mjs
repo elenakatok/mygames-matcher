@@ -67,11 +67,14 @@ const DEFAULTS = {
 };
 
 function parseArgs(argv) {
-  const out = { ...DEFAULTS, negative: false, apiKey: null, apiKeyFile: null, json: false };
+  const out = { ...DEFAULTS, negative: false, selfTest: false, secretEnv: SECRET_NAME,
+    apiKey: null, apiKeyFile: null, json: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     const next = () => argv[(i += 1)];
     if (a === "--negative") out.negative = true;
+    else if (a === "--self-test") out.selfTest = true;
+    else if (a === "--secret-env") out.secretEnv = next();
     else if (a === "--json") out.json = true;
     else if (a === "--base-url") out.baseUrl = next().replace(/\/$/, "");
     else if (a === "--play-url") out.playUrl = next().replace(/\/$/, "");
@@ -89,6 +92,13 @@ function usage() {
 guest-conformance.mjs — conformance harness against the REAL guest endpoints
 
   --negative            run the deliberate-failure suite (the part that matters)
+  --self-test           PROVE THE INSTRUMENT. Runs the whole suite against a shipped,
+                        deliberately broken guest (tools/selftest-stub.mjs) and passes
+                        only if the expected assertions come back RED. Run this before
+                        trusting a green run. Needs no secret and no network.
+  --secret-env <NAME>   env var holding the shared secret (default ${SECRET_NAME}).
+                        The contract specifies the HEADER, not the storage — a third
+                        party names his own variable (spec D13).
   --base-url <url>      guest functions origin   (default ${DEFAULTS.baseUrl})
   --play-url <url>      guest play origin        (default ${DEFAULTS.playUrl})
   --seats <n>           expected guest seat count (default ${DEFAULTS.seats})
@@ -118,9 +128,9 @@ guest-conformance.mjs — conformance harness against the REAL guest endpoints
 // enough to tell "the two projects hold different values" from "the endpoint is broken"
 // without disclosing anything.
 
-function resolveSecret() {
-  if (process.env[SECRET_NAME]) {
-    return { value: process.env[SECRET_NAME], source: `env ${SECRET_NAME}` };
+function resolveSecret(envName = SECRET_NAME) {
+  if (process.env[envName]) {
+    return { value: process.env[envName], source: `env ${envName}` };
   }
 
   const local = join(MATCHER_ROOT, "functions", ".secret.local");
@@ -146,18 +156,25 @@ function resolveSecret() {
   }
 
   console.error(`
-[FATAL] Could not obtain ${SECRET_NAME} for project ${MATCHER_PROJECT}.
+[FATAL] Could not obtain the shared secret (looked for env ${envName}).
 
-  The harness acts as the MATCHER, so it needs the matcher's copy of the provision
-  secret — not beergame's CLASSROOM_PROVISION_SECRET.
+  IF YOU ARE RUNNING THIS INSIDE mygames-matcher:
+    The harness acts as the MATCHER, so it needs the matcher's copy of the provision
+    secret — not beergame's CLASSROOM_PROVISION_SECRET. Obtain it through the existing
+    mechanism (no value is ever typed):
+      ./scripts/set-matcher-secrets.sh        # writes functions/.secret.local
+    or authenticate gcloud with access to ${MATCHER_PROJECT}:
+      gcloud auth login
+    ⚠ Do NOT run 'firebase functions:secrets:set' to fix this — it prompts for a NEW
+      value and creates a mismatched second version. See SECRETS.md.
 
-  Obtain it through the existing mechanism (no value is ever typed):
-    ./scripts/set-matcher-secrets.sh          # writes functions/.secret.local
-  or authenticate gcloud with access to ${MATCHER_PROJECT}:
-    gcloud auth login
-
-  ⚠ Do NOT run 'firebase functions:secrets:set' to fix this — it prompts for a NEW
-    value and creates a mismatched second version. See SECRETS.md.
+  IF YOU ARE A THIRD-PARTY DEVELOPER testing your own guest game:
+    You do not need any of the above. The contract specifies the HEADER, not the
+    storage (spec D13) — name your own variable and point the harness at it:
+      SHARED_SECRET=... node tools/guest-conformance.mjs --secret-env SHARED_SECRET \\
+        --base-url https://your-endpoints.example.com
+    And prove the harness bites first, which needs no secret at all:
+      node tools/guest-conformance.mjs --self-test
 `);
   process.exit(3);
 }
@@ -292,6 +309,16 @@ async function runArc(opts, secret) {
     `roles: ${seats.map((s) => s.role).join(", ")}`);
   check("our groupId is echoed back, not replaced", seats.every((s) => s.groupId === groupId),
     `got ${JSON.stringify([...new Set(seats.map((s) => s.groupId))])}`);
+
+  // ⚠ Spec D6: "The matcher verifies the seats array the guest returns. The guest already
+  // returns it; the matcher currently discards it. It is the natural place to catch a
+  // hand-off that silently placed fewer students than it was given." handoff.ts reads only
+  // out.gameCode, so nothing in production makes this check — the harness does it here.
+  // This is also §5.2's "missing member" probe: --self-test drops one and this goes red.
+  const seatedIds = new Set(seats.map((s) => s.studentId));
+  const unseated = members.filter((m) => !seatedIds.has(m.studentId));
+  check("every posted member received a seat", unseated.length === 0,
+    `${unseated.length} posted member(s) got no seat: ${unseated.map((m) => m.studentId).join(", ")}`);
 
   // 2. deep link ──────────────────────────────────────────────────────────────────────
   const target = seats[0];
@@ -444,7 +471,47 @@ async function runNegative(opts, secret) {
   check("finalize on a never-provisioned code → 404", never.status === 404,
     `got HTTP ${never.status}: ${never.text.slice(0, 160)}`);
 
-  // 7. one more member than the guest has seats → SILENT TRUNCATION.
+  // 7. A MISSING MEMBER — §5.2 names this probe explicitly, and D5 is the change that
+  //    makes it an error. Two flavours, both silent today:
+  //      (a) an UNDER-FULL group: the guest bot-fills the gap and says nothing;
+  //      (b) a member object with no studentId: skipped outright at classroom.ts:198.
+  //    Recorded as baselines, not failures — today's behaviour is wrong but known, and
+  //    D5 ("expected seat count is sent explicitly, and a mismatch is an error") is what
+  //    changes it. When it does, these lines move and the harness says so.
+  const shortStamp = Date.now();
+  const shortId = `conformance-short-${shortStamp}`;
+  const shortMembers = Array.from({ length: Math.max(1, opts.seats - 1) }, (_, i) => ({
+    studentId: `${shortId}-s${i + 1}`,
+    displayName: `Short-${i + 1}`,
+  }));
+  const sh = await callGuest(opts.baseUrl, "provisionClassSession",
+    { instanceId: shortId, groups: [{ groupId: `sg-${shortStamp}`, members: shortMembers }] }, secret);
+  const shSeats = Array.isArray(sh.json?.seats) ? sh.json.seats : [];
+  baseline(`under-full group (${shortMembers.length} of ${opts.seats} seats) is accepted`,
+    sh.status >= 200 && sh.status < 300 ? "accepted" : `rejected ${sh.status}`,
+    "accepted", "rejected, or the seat count agreed explicitly (D5)");
+  check("under-full group seats exactly the members posted (rest bot-filled server-side)",
+    shSeats.length === shortMembers.length, `sent ${shortMembers.length}, seated ${shSeats.length}`);
+  record(BASELINE, "nothing in the response says a seat was bot-filled",
+    `body keys = ${Object.keys(sh.json ?? {}).join(",")}. The matcher cannot tell a fully ` +
+    `human group from one carrying a bot.`);
+
+  const noIdStamp = Date.now();
+  const noIdInstance = `conformance-noid-${noIdStamp}`;
+  const noId = await callGuest(opts.baseUrl, "provisionClassSession",
+    { instanceId: noIdInstance, groups: [{ groupId: `ng-${noIdStamp}`, members: [
+      { studentId: `${noIdInstance}-ok`, displayName: "Present" },
+      { displayName: "NoStudentId" },
+    ] }] }, secret);
+  const noIdSeats = Array.isArray(noId.json?.seats) ? noId.json.seats : [];
+  baseline("member object with NO studentId is silently skipped",
+    noIdSeats.length === 1 ? "skipped-silently" : `seated ${noIdSeats.length}`,
+    "skipped-silently", "named in a structured error (D5/D8)");
+  for (const c of [sh.json?.gameCode, noId.json?.gameCode]) {
+    if (c) await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: c }, secret);
+  }
+
+  // 8. one more member than the guest has seats → SILENT TRUNCATION.
   //    The contract has no seat-count field at all: the matcher's groupSize and the
   //    guest's ROLES.length are independent constants. The guest slices to its own
   //    seat count with no error and no log, so the extra student gets a working deep
@@ -481,14 +548,58 @@ async function runNegative(opts, secret) {
 
 // ── main ──────────────────────────────────────────────────────────────────────────────
 
+/**
+ * --self-test — spec §5.2/§5.4. Point the harness at a shipped, deliberately broken guest
+ * and require the named assertions to come back RED. A conformance harness that has never
+ * failed is not known to be reading anything, so this runs BEFORE trusting a green run.
+ *
+ * Inverted reporting: a FAIL from the suite is the desired outcome here. An expected
+ * failure that PASSES means the harness stopped checking; an expected failure whose
+ * assertion NAME has vanished means it was renamed and the proof has rotted into a rubber
+ * stamp — both are reported as a broken instrument, and both exit non-zero.
+ */
+async function runSelfTest(opts) {
+  const { startSelfTestStub, EXPECTED_FAILURES } = await import("./selftest-stub.mjs");
+  const { server, baseUrl } = await startSelfTestStub();
+
+  console.log("guest-conformance --self-test — PROVING THE INSTRUMENT");
+  console.log(`  target      ${baseUrl}  (shipped, deliberately broken guest)`);
+  console.log(`  ⚠ this proves the HARNESS bites. It says nothing about any real guest.`);
+  console.log(`  expecting these to go RED:`);
+  for (const n of EXPECTED_FAILURES) console.log(`      - ${n}`);
+  console.log(`  Only those three constitute the proof. The stub is a broken guest, so other`);
+  console.log(`  lines may also read oddly — judge this run by the INSTRUMENT PROOF block.`);
+  console.log();
+
+  const stubOpts = { ...opts, baseUrl, playUrl: "http://127.0.0.1:0", negative: true, apiKey: null, apiKeyFile: null };
+  await runArc(stubOpts, "any-secret-is-accepted-by-the-stub");
+  await runNegative(stubOpts, "any-secret-is-accepted-by-the-stub");
+  server.close();
+
+  console.log(`\n── INSTRUMENT PROOF ──`);
+  let broken = 0;
+  for (const name of EXPECTED_FAILURES) {
+    const hit = results.find((r) => r.name === name);
+    if (!hit) { console.log(`  ✗ MISSING   '${name}' — assertion renamed or removed; proof is void`); broken += 1; }
+    else if (hit.status === FAIL) console.log(`  ✓ BIT       '${name}' went red as required`);
+    else { console.log(`  ✗ BLIND     '${name}' returned ${hit.status}; the harness is not reading this`); broken += 1; }
+  }
+  console.log(broken === 0
+    ? `\n  ✅ Instrument proved: ${EXPECTED_FAILURES.length}/${EXPECTED_FAILURES.length} planted defects detected.`
+    : `\n  ❌ Instrument NOT proved: ${broken} problem(s) above. Do not trust a green run.`);
+  process.exit(broken === 0 ? 0 : 1);
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const { value: secret, source } = resolveSecret();
+  if (opts.selfTest) return runSelfTest(opts);
+
+  const { value: secret, source } = resolveSecret(opts.secretEnv);
 
   console.log("guest-conformance — REAL guest endpoints, HTTP only, no beergame imports");
   console.log(`  base url    ${opts.baseUrl}`);
   console.log(`  play url    ${opts.playUrl}`);
-  console.log(`  secret      ${SECRET_NAME} from ${source}`);
+  console.log(`  secret      ${opts.secretEnv} from ${source}`);
   console.log(`  fingerprint sha256:${fingerprint(secret)}  (value never printed)`);
   console.log(`  mode        ${opts.negative ? "arc + negative" : "arc only (add --negative)"}`);
 
