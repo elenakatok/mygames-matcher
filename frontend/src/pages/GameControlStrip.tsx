@@ -9,6 +9,9 @@ import {
   getGameConfig, setClockMode, getOnlineGroups, moveSeat, topUpGroupWithBots, startAllGroups,
   type OnlineGroup,
 } from '../api'
+import {
+  statusLine, willHandOff, waitingGroups, waitingSentence, confirmText, reportLines, type WaitingGroup,
+} from '../handoffStatus'
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // THE INSTRUCTOR'S CONTROL STRIP — session mode, Start (= hand-off), and live per-group
@@ -39,39 +42,49 @@ import {
 
 const POLL_MS = 4000
 
-function statusLine(g: OnlineGroup): string {
-  if (g.started) return 'handed off — in the Beer Game'
-  if (g.free_seats > 0) return `${g.occupants.length} of ${g.seat_count} — short ${g.free_seats} seat${g.free_seats === 1 ? '' : 's'}`
-  return 'full — ready to hand off'
-}
+// ⚠ STATUS, DIALOG AND REPORT ALL COME FROM THE SERVER'S PLAN (../handoffStatus.ts). A full
+// group is not a ready group: online, Start skips a group until every human has logged in,
+// and before 2026-09-10 this strip said "ready", the dialog promised the start, and the call
+// reported "0 handed off" with the reason thrown away.
 
-function StartClass({ readyCount, onDone }: { readyCount: number; onDone: () => void }) {
+function StartClass({ readyCount, waiting, onDone }: { readyCount: number; waiting: WaitingGroup[]; onDone: () => void }) {
   const [busy, setBusy] = useState(false)
-  const [summary, setSummary] = useState<string | null>(null)
+  const [summary, setSummary] = useState<string[] | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const go = async () => {
     if (readyCount === 0 || busy) return
-    if (!window.confirm(`Start the Beer Game for all ${readyCount} ready group${readyCount === 1 ? '' : 's'}?`)) return
+    if (!window.confirm(confirmText(readyCount, waiting))) return
     setBusy(true); setErr(null)
     try {
       const r = await startAllGroups()
-      setSummary(`${r.started} handed off`)
+      setSummary(reportLines(r))
       onDone()
     } catch (e) { setErr(e instanceof Error ? e.message : 'Could not hand off.') }
     setBusy(false)
   }
+  // The blocked reason sits NEXT TO the button, live, whether or not anything else is ready.
+  const blocked = waiting.map(waitingSentence)
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: spacing.gapSm }}>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: spacing.gapSm, flexWrap: 'wrap' }}>
       <button
         data-testid="start-class"
         onClick={go}
         disabled={busy || readyCount === 0}
-        title={readyCount === 0 ? 'No full groups are ready to hand off.' : `Hand off ${readyCount} ready group${readyCount === 1 ? '' : 's'}.`}
+        title={readyCount === 0
+          ? (blocked.length ? `No group is ready. ${blocked.join(' ')}` : 'No full groups are ready to hand off.')
+          : `Hand off ${readyCount} ready group${readyCount === 1 ? '' : 's'}.`}
         style={{ padding: '0.35rem 0.8rem', fontWeight: 700, cursor: busy || readyCount === 0 ? 'not-allowed' : 'pointer', borderRadius: 4, border: `1px solid ${colors.borderMid}`, background: readyCount === 0 ? colors.white : '#15803d', color: readyCount === 0 ? colors.textMuted : colors.white, opacity: readyCount === 0 ? 0.6 : 1 }}
       >
         {busy ? 'Starting…' : 'Start the game'}
       </button>
-      {summary && <span data-testid="start-class-summary" style={{ fontSize: typography.sizeXs, color: colors.textSecondary }}>{summary}</span>}
+      {blocked.length > 0 && (
+        <span data-testid="start-class-waiting" style={{ fontSize: typography.sizeXs, color: '#b45309' }}>{blocked.join(' ')}</span>
+      )}
+      {summary && (
+        <span data-testid="start-class-summary" style={{ fontSize: typography.sizeXs, color: colors.textSecondary }}>
+          {summary.map((line, i) => <span key={i} style={{ display: 'block' }}>{line}</span>)}
+        </span>
+      )}
       {err && <span data-testid="start-class-error" role="alert" style={{ fontSize: typography.sizeXs, color: '#b91c1c' }}>{err}</span>}
     </span>
   )
@@ -120,8 +133,9 @@ export default function GameControlStrip() {
 
   const online = clockMode === 'off'
   const anyStarted = seats.some((g) => g.started)
-  // Ready to hand off = full and not yet handed off.
-  const readyCount = seats.filter((g) => !g.started && g.free_seats === 0).length
+  // Ready to hand off = what Start will ACTUALLY hand off (the server's plan) — not merely full.
+  const readyCount = seats.filter(willHandOff).length
+  const waiting = waitingGroups(seats)
 
   /*
     Destinations for the No-Group pool and per-group moves: not-started groups with a free
@@ -240,7 +254,7 @@ export default function GameControlStrip() {
       destinations={destinations}
       onPlace={place}
       headerActions={
-        seats.length > 0 ? <StartClass readyCount={readyCount} onDone={refresh} /> : undefined
+        seats.length > 0 ? <StartClass readyCount={readyCount} waiting={waiting} onDone={refresh} /> : undefined
       }
       emptyMessage={
         !everLoaded && !error

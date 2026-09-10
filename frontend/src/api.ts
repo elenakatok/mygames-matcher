@@ -153,6 +153,26 @@ export type OnlineGroup = {
   seat_count:   number
   free_seats:   number
   occupants:    OnlineOccupant[]
+  /**
+   * Whether Start will hand this group off, and if not, why — from the SAME plan
+   * startAllGroups decides with (functions/src/handoffPlan.ts). Seat count alone is not
+   * readiness: online, a full group still waits until every human has logged in.
+   */
+  handoff?:     GroupHandOff | null
+}
+
+export type HandOffStatus = 'handed_off' | 'short' | 'waiting' | 'ready'
+export type WaitingMember = { participant_id: string; display_name: string }
+export type GroupHandOff = { status: HandOffStatus; waiting: WaitingMember[] }
+export type HandOffOutcome = 'started' | 'already_running' | 'skipped_short' | 'skipped_waiting'
+/** startAllGroups' reply: the counters it always returned, plus what it did with each group. */
+export type StartAllResult = {
+  ok: boolean
+  started: number
+  skipped_short?: number
+  skipped_waiting?: number
+  already_running?: number
+  groups?: Array<{ group_id: string; group_number: number; outcome: HandOffOutcome; waiting: WaitingMember[] }>
 }
 
 /**
@@ -197,7 +217,7 @@ export const topUpGroupWithBots = (groupId: string) =>
  * since, and skips groups already handed off.
  */
 export const startAllGroups = () =>
-  callFnInstructor<{ ok: boolean; started: number; skipped_short?: number; already_running?: number }>('startAllGroups', {})
+  callFnInstructor<StartAllResult>('startAllGroups', {})
 
 // ── End-of-assignment operational report — "who arrived / who is in a game" ──
 export type GroupCategory = 'finished' | 'in_progress' | 'never_started'

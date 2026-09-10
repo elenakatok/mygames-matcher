@@ -422,6 +422,12 @@ async function onlineFlow() {
   const stEarly = await startAll(gid)
   check(stEarly.result.started === 0 && (stEarly.result.skipped_waiting ?? 0) >= 1,
     `2a. Start before any login hands off nothing (waiting on no-shows) — started ${stEarly.result.started}, waiting ${stEarly.result.skipped_waiting}`)
+  // …and it SAYS so per group, naming whom each is waiting on (2026-09-10). A count alone
+  // told the instructor "0 handed off" and nothing else.
+  const waitingOut = (stEarly.result.groups ?? []).filter((g) => g.outcome === 'skipped_waiting')
+  check(waitingOut.length === stEarly.result.skipped_waiting &&
+    waitingOut.every((g) => g.waiting.length > 0 && g.waiting.every((w) => w.display_name && w.display_name !== w.participant_id)),
+    `2b. …with each skipped group naming its not-logged-in students — ${waitingOut.map((g) => `group ${g.group_number}: ${g.waiting.map((w) => w.display_name).join('/')}`).join('; ')}`)
 
   // Students arrive (recordLogin returns the online mode so the client routes correctly).
   let modeOk = true
@@ -433,6 +439,10 @@ async function onlineFlow() {
   const og = await getOnline(gid); check(og.ok && og.result.groups.length >= 1, `4. getOnlineGroups — ${og.result?.groups?.length ?? og.error} group(s)`)
   const g0 = og.result.groups[0]
   check(g0.occupants.some((o) => o.display_name && o.display_name !== o.participant_id), `5. occupants carry real display names`)
+  // Once everyone has logged in, no group reads "waiting" — full ones are ready, short ones short.
+  check(og.result.groups.every((g) => g.handoff && g.handoff.status !== 'waiting' &&
+    g.handoff.status === (g.free_seats > 0 ? 'short' : 'ready')),
+    `5a. after every login, each group's hand-off status is ready (full) or short — ${og.result.groups.map((g) => g.handoff?.status).join(', ')}`)
 
   // Move a student from a group with a free seat is not guaranteed; move within a full
   // group to a NEW group to prove seat management works pre-hand-off.

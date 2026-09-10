@@ -37,6 +37,7 @@ import {
   type GuestResultPlayer,
 } from "./handoff";
 import { cohortScore } from "./scoring";
+import { planHandOff, type GroupHandOffPlan, type HandOffOutcome, type WaitingMember } from "./handoffPlan";
 import { HttpsError } from "firebase-functions/v2/https";
 
 const db = () => admin.firestore();
@@ -99,7 +100,57 @@ async function progressOf(iid: string): Promise<Map<string, GroupProgress>> {
 
 export const groupParticipantsOnline = makeGroupParticipantsOnline(ctx, { assignRole: "player" });
 export const recordLogin = makeRecordLogin(ctx);
-export const getOnlineGroups = makeGetOnlineGroups(ctx);
+/**
+ * Every group's hand-off status, from the ONE rule startAllGroups acts on (handoffPlan.ts).
+ * Reads exactly what startAllGroups always read: config/main (mode), groups, participants.
+ */
+async function readHandOffPlan(iid: string): Promise<GroupHandOffPlan[]> {
+  const instRef = db().collection("game_instances").doc(iid);
+  const [cfgSnap, groupsSnap, partsSnap] = await Promise.all([
+    instRef.collection("config").doc("main").get(),
+    instRef.collection("groups").get(),
+    instRef.collection("participants").get(),
+  ]);
+  return planHandOff({
+    groups: groupsSnap.docs.map((d) => ({ id: d.id, data: d.data() as Record<string, unknown> })),
+    participants: new Map(partsSnap.docs.map((d) => [d.id, d.data() as Record<string, unknown>])),
+    online: String((cfgSnap.data() as Record<string, unknown>)?.["clock_mode"] ?? "on") === "off",
+    groupSize: ACTIVE_TENANT.groupSize,
+  });
+}
+
+/**
+ * getOnlineGroups — the shared read, plus each group's HAND-OFF status (`handoff`): ready,
+ * short, already handed off, or waiting on NAMED students who have not logged in.
+ *
+ * ⚠ WHY A WRAPPER. The row used to say "full — ready to hand off" from seat count alone,
+ * while Start also requires every human to have logged in. The shared factory carries no
+ * login state, and changing it is a game-server release; so the matcher runs the shared
+ * handler unchanged (`.run`) and attaches the plan startAllGroups decides with.
+ * ⚠ Same export name, same callable trigger, same options (the shared corsOf is
+ * `{ cors: def.corsOrigins }`) — a deploy updates it in place: no new function, and so no
+ * new run.invoker binding.
+ */
+const sharedGetOnlineGroups = makeGetOnlineGroups(ctx);
+export const getOnlineGroups = onCall(
+  { cors: matcherGameDef.corsOrigins },
+  async (request: CallableRequest) => {
+    const base = await sharedGetOnlineGroups.run(request);
+    const iid = await extractInstructorGameId(
+      request.data as Record<string, unknown>,
+      process.env.FUNCTIONS_EMULATOR === "true",
+      request.rawRequest.headers.authorization as string | undefined,
+    );
+    const byId = new Map((await readHandOffPlan(iid)).map((p) => [p.group_id, p]));
+    return {
+      ...base,
+      groups: base.groups.map((g) => {
+        const p = byId.get(g.group_id);
+        return { ...g, handoff: p ? { status: p.status, waiting: p.waiting } : null };
+      }),
+    };
+  },
+);
 export const moveSeat = makeMoveSeat(ctx);
 export const topUpGroupWithBots = makeTopUpGroupWithBots(ctx);
 export const flagGroup = makeFlagGroup(ctx);
@@ -134,35 +185,27 @@ export const startAllGroups = onCall(
       process.env.FUNCTIONS_EMULATOR === "true",
       request.rawRequest.headers.authorization as string | undefined,
     );
-    const instRef = db().collection("game_instances").doc(iid);
-
-    const [cfgSnap, groupsSnap, partsSnap] = await Promise.all([
-      instRef.collection("config").doc("main").get(),
-      instRef.collection("groups").get(),
-      instRef.collection("participants").get(),
-    ]);
-
-    const online = String((cfgSnap.data() as Record<string, unknown>)?.["clock_mode"] ?? "on") === "off";
-    // The set of participants who have actually logged in (recordLogin stamps last_login_at).
-    const loggedIn = new Set(
-      partsSnap.docs.filter((d) => (d.data() as Record<string, unknown>)["last_login_at"] != null).map((d) => d.id),
-    );
+    // Decided by the SAME plan the instructor's row and the Start dialog read (handoffPlan.ts),
+    // so what the screen promised is what happens. The rule itself is unchanged: already
+    // handed off → skip; not full → skip; online with a human not logged in → skip.
+    const plan = await readHandOffPlan(iid);
 
     let started = 0, skippedShort = 0, skippedWaiting = 0, alreadyRunning = 0;
-    // Deterministic order (matches the dashboard's group numbering: group ids sorted).
-    const docs = groupsSnap.docs.slice().sort((a, b) => a.id.localeCompare(b.id));
-    for (const d of docs) {
-      const g = d.data() as Record<string, unknown>;
-      if (g["gameCode"]) { alreadyRunning++; continue; } // already handed off
-      const seats = Array.isArray(g["player_participants"]) ? (g["player_participants"] as string[]) : [];
-      const bots = new Set(Array.isArray(g["bot_participants"]) ? (g["bot_participants"] as string[]) : []);
-      const humans = seats.filter((pid) => !bots.has(pid));
-      if (seats.length !== ACTIVE_TENANT.groupSize) { skippedShort++; continue; } // not full → top up first
-      if (online && !humans.every((pid) => loggedIn.has(pid))) { skippedWaiting++; continue; } // a member is a no-show
-      await provisionGroupToTenant(iid, d.id);
-      started++;
+    // ⚠ PER GROUP, WITH NAMES. The counters alone told the instructor "0 handed off" and
+    // nothing else; `groups` says which group was skipped and whom it is waiting on.
+    const groups: Array<{ group_id: string; group_number: number; outcome: HandOffOutcome; waiting: WaitingMember[] }> = [];
+    for (const p of plan) {
+      let outcome: HandOffOutcome;
+      if (p.status === "handed_off") { alreadyRunning++; outcome = "already_running"; }
+      else if (p.status === "short") { skippedShort++; outcome = "skipped_short"; }       // not full → top up first
+      else if (p.status === "waiting") { skippedWaiting++; outcome = "skipped_waiting"; } // a member is a no-show
+      else { await provisionGroupToTenant(iid, p.group_id); started++; outcome = "started"; }
+      groups.push({ group_id: p.group_id, group_number: p.group_number, outcome, waiting: p.waiting });
     }
-    return { ok: true as const, started, skipped_short: skippedShort, skipped_waiting: skippedWaiting, already_running: alreadyRunning };
+    return {
+      ok: true as const, started, skipped_short: skippedShort, skipped_waiting: skippedWaiting,
+      already_running: alreadyRunning, groups,
+    };
   },
 );
 
