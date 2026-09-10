@@ -59,26 +59,14 @@ export const CLASSROOM_URL = import.meta.env.DEV
   ? 'http://localhost:5173'
   : 'https://classroom.mygames.live'
 
-/**
- * The guest game's play base — where a handed-off student is redirected. The matcher
- * appends `?class=<gameCode>&sid=<participantId>` (see functions/src/handoff.ts playLinkFor,
- * whose logic this mirrors on the client because the group's gameCode is read from the
- * group doc, not returned by a callable). Single-tenant per deploy, so it is a build
- * constant: `VITE_PLAY_URL` in .env.production, defaulting to the live Beer Game.
+/*
+ * ⚠ NO PLAY ORIGIN IN THE FRONTEND (D12 — "One source of truth for the play URL").
+ * This file used to hold PLAY_URL (from VITE_PLAY_URL), a dead playLinkFor, and
+ * reportLinkFor — a second copy of the guest's origin that could drift silently from the one
+ * students are actually sent to. All three are gone. Student links are minted by getSeatLink;
+ * the instructor report link is written onto the group doc at hand-off (`report_url`); both
+ * come from functions/src/tenants.ts playUrl.
  */
-export const PLAY_URL =
-  (import.meta.env.VITE_PLAY_URL as string | undefined)?.replace(/\/$/, '') ??
-  'https://beergame-mygames-live.web.app'
-
-/**
- * ⚠ DEAD as of the seat-token pass (D2), kept only so D12 can retire it deliberately.
- * The play link now carries a signed `t` token, and the HMAC needs the shared provisioning
- * secret — which a browser must never hold. Links are minted server-side by getSeatLink.
- * Do NOT call this: a link without `t` is refused by the guest.
- */
-export function playLinkFor(gameCode: string, participantId: string): string {
-  return `${PLAY_URL}/?class=${encodeURIComponent(gameCode)}&sid=${encodeURIComponent(participantId)}`
-}
 
 /**
  * Mint this student's short-lived signed deep link into the guest game (D2).
@@ -87,11 +75,6 @@ export function playLinkFor(gameCode: string, participantId: string): string {
  */
 export const getSeatLink = (args: CallArgs = {} as BearerArgs) =>
   callFn<{ url: string; expires_in: number }>('getSeatLink', args)
-
-/** The instructor's read-only report for a handed-off group (orders + inventory over time). */
-export function reportLinkFor(gameCode: string): string {
-  return `${PLAY_URL}/?report=${encodeURIComponent(gameCode)}`
-}
 
 // onCall auth errors arrive as FirebaseError with code 'functions/permission-denied'
 // or 'functions/unauthenticated' — not HTTP status strings.

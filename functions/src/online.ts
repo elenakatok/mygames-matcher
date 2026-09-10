@@ -32,9 +32,11 @@ import {
   finalizeGuestSession,
   getGuestResults,
   mintSeatLink,
+  MalformedGuestResultsError,
   PROVISION_SECRET,
   type GuestResultPlayer,
 } from "./handoff";
+import { cohortScore } from "./scoring";
 import { HttpsError } from "firebase-functions/v2/https";
 
 const db = () => admin.firestore();
@@ -187,7 +189,7 @@ interface GradeRow {
   status: "completed" | "no_show";
   role: string | null;
   raw_score: number | null; // Outcome column = the student's INDIVIDUAL cost
-  normalized_score: number | null; // z-score of the student's TEAM cost (higher = lower cost = better)
+  normalized_score: number | null; // z-score of the student's TEAM outcome (positive = better team; direction is tenant data, D11)
   knowledge_check_score: number | null;
   details: Record<string, unknown>;
 }
@@ -213,7 +215,8 @@ async function pushGrade(row: GradeRow, url: string, secret: string): Promise<vo
  *   1. End every handed-off guest session (freeze costs) — idempotent, safe on already-ended.
  *   2. Read every team's + player's costs (getGuestResults / Beer Game getClassResults).
  *   3. Pool the TEAM costs across all groups → mean/std → each team's z-score
- *      (z = (mean − teamCost)/std, so a LOWER cost is a HIGHER, better z; std 0 → all z 0).
+ *      (a positive z is a better-than-average team; which way "better" points is the tenant's
+ *      scoreDirection, D11 — the Beer Game is lower_is_better; std 0 → all z 0).
  *   4. Per human player: write raw_score = their INDIVIDUAL cost + finalized_at on the matcher
  *      participant doc (drives the dashboard Outcome column), and push a gradebook row
  *      (raw_score = individual cost, normalized_score = team z) to the classroom.
@@ -246,9 +249,27 @@ export const scoreAndRecord = onCall(
     // 2. Read costs for every session.
     const results: Array<{ code: string; players: GuestResultPlayer[] }> = [];
     const resultsFailed: Array<{ code: string; reason: string }> = [];
+    const malformed: Array<{ code: string; reason: string }> = [];
     for (const code of codes) {
       try { const r = await getGuestResults(code); results.push({ code, players: r.players }); }
-      catch (e) { resultsFailed.push({ code, reason: e instanceof Error ? e.message : String(e) }); }
+      catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        if (e instanceof MalformedGuestResultsError) malformed.push({ code, reason });
+        else resultsFailed.push({ code, reason });
+      }
+    }
+    // ⚠ D10 — "Malformed results fail loudly." A wrong-SHAPED reply is a contract break on
+    // the guest's side, so it hits every session that guest serves, and grading the rest
+    // would z-score the class against a cohort with teams silently missing. Refuse the whole
+    // run — before one grade is written or pushed — and say why on the button. (An
+    // UNREACHABLE session, an HTTP error, keeps the old per-session tolerance: it is reported
+    // in results.failed and the button is re-runnable.)
+    if (malformed.length > 0) {
+      throw new HttpsError(
+        "failed-precondition",
+        `The guest game returned malformed results for ${malformed.length} of ${codes.length} ` +
+        `session(s), so nothing was graded. ${malformed[0].reason}`,
+      );
     }
 
     // 3. Pool the distinct TEAM costs (one data point per team that has a human) → mean/std.
@@ -261,13 +282,10 @@ export const scoreAndRecord = onCall(
       }
     }
     const teamCosts = [...teamCostByKey.values()];
-    const mean = teamCosts.length ? teamCosts.reduce((a, b) => a + b, 0) / teamCosts.length : 0;
-    const variance = teamCosts.length
-      ? teamCosts.reduce((a, b) => a + (b - mean) ** 2, 0) / teamCosts.length
-      : 0;
-    const std = Math.sqrt(variance);
-    // Lower cost is better → positive z. std 0 (all teams equal) → every z is 0.
-    const zFor = (cost: number): number => (std > 0 ? Number(((mean - cost) / std).toFixed(4)) : 0);
+    // D11 — the direction is TENANT DATA (tenants.ts scoreDirection), not code. For the Beer
+    // Game a lower total cost is the better team and so gets the positive z; a points game
+    // declares higher_is_better. std 0 (all teams equal) → every z is 0.
+    const { mean, std, zFor } = cohortScore(teamCosts, ACTIVE_TENANT.scoreDirection);
 
     // 4. Grade each human player: Outcome = individual cost, gradebook z = team z.
     // ⚠ EMULATOR ONLY: the e2e harness points the grade push at its mock classroom. Gated on

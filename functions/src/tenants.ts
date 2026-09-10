@@ -12,14 +12,27 @@
 // short groups. So the matcher needs NO per-role machinery — just a group size + bots.
 
 import type { ConfigFieldDef } from "@mygames/game-server";
+import type { ScoreDirection } from "./scoring";
 
 export interface MatchingTenant {
   /** Registry game_id — what the classroom launches, carried in the launch JWT. */
   gameId: string;
   title: string;
 
-  /** Undifferentiated matching group size. Beer Game = 4 (one supply chain). */
+  /**
+   * Undifferentiated matching group size. Beer Game = 4 (one supply chain).
+   * D5: sent to the guest as `seatCount` on every hand-off, and the guest refuses a mismatch.
+   */
   groupSize: number;
+
+  /**
+   * D11 — "Score direction is tenant configuration, not code." Which way the guest's team
+   * outcome (the results' teamCost) points. scoreAndRecord z-scores it across every group;
+   * this decides whether a LOWER number is the better team (the Beer Game's total cost) or
+   * a HIGHER one (a points game). ⚠ Required, with no default: guessing wrong grades a whole
+   * class backwards with nothing on any screen to indicate it, so every tenant must say.
+   */
+  scoreDirection: ScoreDirection;
 
   /** The guest game's seat roles — METADATA only (the guest game assigns them). */
   seatRoles?: string[];
@@ -46,7 +59,10 @@ export interface MatchingTenant {
     resultsUrl: string;
     /** Name of the secret (in the matcher's project) holding the shared provisioning secret. */
     secretName: string;
-    /** Student play URL; the matcher appends `?class=<gameCode>&sid=<participantId>`. */
+    /**
+     * The guest's play origin — the ONLY copy of it (D12). handoff.ts builds both the
+     * student's signed deep link (?class=&sid=&t=) and the instructor report (?report=) from it.
+     */
     playUrl: string;
   };
 
@@ -69,6 +85,8 @@ export const BEERGAME_TENANT: MatchingTenant = {
   gameId: "beergame",
   title: "The Beer Game",
   groupSize: 4,
+  // The Beer Game's team outcome is TOTAL SUPPLY-CHAIN COST: the cheaper team played better.
+  scoreDirection: "lower_is_better",
   seatRoles: ["retailer", "wholesaler", "distributor", "factory"],
   modes: { inClass: true, online: true },
   corsOrigins: [

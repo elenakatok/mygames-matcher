@@ -102,13 +102,23 @@ let gradePushes = []         // every gradebook row the MATCHER pushed to the mo
 let membersByCode = {}       // gameCode → the human members provisioned into it (for mock results)
 let rosterRequests = 0
 let nextGameCode = 1
+let indexByCode = {}         // gameCode → hand-off order (drives each session's mock team cost)
+// Pass C: contractFlow() flips this to make the mock guest lie on purpose.
+//   'ok' | 'drop-seat' (seats[] omits a posted member — D6 must refuse the hand-off)
+//        | 'malformed-results' (players is not an array — D10 must refuse to grade)
+let mockMode = 'ok'
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'   // the real guest's; no 0, 1, I, O
+const MOCK_ROLES = ['retailer', 'wholesaler', 'distributor', 'factory']
 
 // Mock guest-game results for a gameCode. Team cost is DETERMINISTIC from the code's numeric
 // suffix so distinct groups get distinct costs (→ non-zero std → a real z-score to assert).
 // Individual costs vary per seat so the Outcome column has distinguishable values.
 function mockResultsFor(code) {
   const members = membersByCode[code] ?? []
-  const suffix = parseInt(String(code).replace(/\D/g, ''), 10) || 1
+  // Distinct, deterministic team cost per session (by hand-off order), so ≥2 groups give a
+  // non-zero std and a real z. (It used to parse digits out of `BEER001`; the codes are
+  // contract-shaped now and need not carry any.)
+  const suffix = (indexByCode[code] ?? 0) + 1
   const teamCost = 1000 + suffix * 100
   const roles = ['retailer', 'wholesaler', 'distributor', 'factory']
   const players = members.map((m, i) => ({
@@ -142,15 +152,35 @@ function startClassroom() {
         const url = req.url || '/'
         // The mock BEER GAME hand-off (/provision): a hand-off carries `groups` — answer with
         // a game code and remember which humans went into it (so /results can echo their costs).
+        // ⚠ The mock speaks the FROZEN v1 now (pass C): a contract-shaped gameCode (the old
+        // `BEER001` holds 0 and 1, which the real guest's regex rejects — and the matcher now
+        // checks), the seatCount echoed, one seat per posted member, and a per-group bot
+        // report. The matcher VERIFIES all of it (D6), so a mock answering the old way would
+        // now fail every hand-off — which is the point: the mock can no longer be out of spec.
         if (url.endsWith('/provision') || (url === '/' && parsed && Array.isArray(parsed.groups))) {
           provisionRequests.push(parsed)
-          const code = `BEER${String(nextGameCode++).padStart(3, '0')}`
-          membersByCode[code] = parsed?.groups?.[0]?.members ?? []
-          r.end(JSON.stringify({ contract_version: 1, gameCode: code })); return
+          const i = nextGameCode++
+          const code = `BEER${CODE_ALPHABET[i % 32]}${CODE_ALPHABET[Math.floor(i / 32) % 32]}`
+          const g = parsed?.groups?.[0] ?? {}
+          const members = g.members ?? []
+          membersByCode[code] = members
+          indexByCode[code] = i
+          const seatCount = parsed?.seatCount
+          let seats = members.map((m, k) => ({ studentId: m.studentId, role: MOCK_ROLES[k % 4], teamId: 'team1', playerId: `p${i}-${k}`, groupId: g.groupId }))
+          if (mockMode === 'drop-seat') seats = seats.slice(0, -1)   // a posted member gets no seat — D6 must catch it
+          const humans = seats.length
+          r.end(JSON.stringify({
+            contract_version: 1, gameCode: code, seatCount, seats,
+            groups: [{ groupId: g.groupId, teamId: 'team1', humanSeats: humans, botSeats: seatCount - humans, botRoles: MOCK_ROLES.slice(humans) }],
+          })); return
         }
         // /results — the matcher reads a session's team + player costs (Beer Game getClassResults).
         if (url.endsWith('/results')) {
           finalizeRequests // no-op ref to keep lints quiet
+          // D10: a wrong-SHAPED 200 (players is not an array) must stop grading, loudly.
+          if (mockMode === 'malformed-results') {
+            r.end(JSON.stringify({ contract_version: 1, ok: true, gameCode: parsed?.gameCode, teams: [], players: 'oops' })); return
+          }
           r.end(JSON.stringify(mockResultsFor(parsed?.gameCode))); return
         }
         // /finalize — end a session, ack ended.
@@ -245,6 +275,7 @@ async function groupDoc(gid, groupId) {
   return {
     gameCode: f.gameCode?.stringValue ?? null,
     locked: f.seats_locked_at != null,
+    report_url: f.report_url?.stringValue ?? null,
     player_participants: (f.player_participants?.arrayValue?.values ?? []).map((v) => v.stringValue),
     bot_participants: (f.bot_participants?.arrayValue?.values ?? []).map((v) => v.stringValue),
   }
@@ -285,11 +316,12 @@ async function classroomFlow() {
   check(!!handoff, `7. mock Beer Game received a hand-off`)
   const members = handoff?.groups?.[0]?.members ?? []
   check(members.length === 4, `8. hand-off carried 4 human members — got ${members.length}`)
-  check(members.every((x) => x.studentId && x.displayName), `9. members carry studentId + displayName`)
-  // Names must be the ROSTER names, not the raw pid (the "dNkRCO…" bug).
-  const nameById = Object.fromEntries(ROSTER.map((r) => [r.participant_id, r.name]))
-  const namesOk = members.every((x) => x.displayName === nameById[x.studentId] && x.displayName !== x.studentId)
-  check(namesOk, `9a. member displayNames are real names, not pids — ${members.map((x) => x.displayName).join(', ')}`)
+  // ⚠ D4 — no student NAME crosses the boundary. These lines used to assert the OPPOSITE
+  // (that members carried the roster displayName) — i.e. they certified the PII crossing.
+  check(members.every((x) => x.studentId && Object.keys(x).length === 1), `9. members carry studentId ONLY — no displayName (D4)`)
+  const leaked = ROSTER.map((r) => r.name).filter((n) => JSON.stringify(handoff ?? {}).includes(n))
+  check(leaked.length === 0, `9a. no roster name appears anywhere in the hand-off body (D4) — ${leaked.join(', ') || 'none'}`)
+  check(handoff?.seatCount === 4, `9c. hand-off declares seatCount 4 explicitly (D5) — got ${JSON.stringify(handoff?.seatCount)}`)
   // Demand config translated correctly: 10 weeks, 5 for weeks 0-2, 12 from week 3.
   const cfgOut = handoff?.config ?? {}
   const expectedDemand = [5, 5, 5, 12, 12, 12, 12, 12, 12, 12]
@@ -302,6 +334,8 @@ async function classroomFlow() {
   const gdoc = grp ? await groupDoc(gid, grp.group_id) : null
   check(!!gdoc?.gameCode, `10. group doc carries a gameCode (student redirect fires) — ${gdoc?.gameCode ?? 'none'}`)
   check(gdoc?.locked === true, `11. group is locked at hand-off (seats_locked_at set)`)
+  check(gdoc?.report_url === `https://beergame-mygames-live.web.app/?report=${gdoc?.gameCode}`,
+    `11a. group doc carries report_url, built from the ONE play origin (D12) — ${gdoc?.report_url ?? 'none'}`)
 
   // Re-press Start: idempotent, hands off nothing new (the group already carries a code).
   const st2 = await startAll(gid);              check(st2.ok && st2.result.started === 0, `12. re-press Start is idempotent — started ${st2.result?.started ?? st2.error}`)
@@ -361,6 +395,9 @@ async function shortGroupFlow() {
   const handoff = provisionRequests[before]
   const members = handoff?.groups?.[0]?.members ?? []
   check(members.length === 2, `7. hand-off carried 2 HUMANS only (placeholders excluded) — got ${members.length}`)
+  // Under-full is the DESIGNED bot-fill path (D5): 2 humans for 4 seats, and the hand-off only
+  // succeeded because the guest's report of 2 bot seats matched what the matcher expects (D6).
+  check(handoff?.seatCount === 4, `7a. …with seatCount 4, so the guest bot-fills 2 and reports it (D5/D6) — ${JSON.stringify(handoff?.seatCount)}`)
   const ids = members.map((x) => x.studentId).sort()
   check(ids[0] === 'stu1' && ids[1] === 'stu2', `8. the two humans are the real students — ${ids.join(',')}`)
   const gdoc = await groupDoc(gid, newGroup)
@@ -422,8 +459,55 @@ async function onlineFlow() {
   // Lower team cost → higher (positive) z; higher cost → negative. Both signs must appear.
   const zs = gradePushes.map((p) => p.normalized_score).filter((z) => typeof z === 'number')
   check(zs.some((z) => z > 0) && zs.some((z) => z < 0), `12. z-scores span both signs (better + worse teams) — ${[...new Set(zs)].sort((a, b) => a - b).join(', ')}`)
+  // D11: direction is tenant data — lower_is_better for the Beer Game — so the CHEAPEST team
+  // must hold the highest z. Check 12 would still pass with the class graded backwards;
+  // this one would not.
+  const byCost = gradePushes.filter((p) => typeof p.details?.team_cost === 'number')
+    .sort((a, b) => a.details.team_cost - b.details.team_cost)
+  check(byCost.length >= 2 && byCost[0].normalized_score > 0 && byCost[byCost.length - 1].normalized_score < 0,
+    `12a. cheapest team z>0, costliest z<0 (lower_is_better, D11) — ${byCost.map((p) => `${p.details.team_cost}:${p.normalized_score}`).join(' ')}`)
   // Every pushed row still carries the individual cost as raw_score.
   check(gradePushes.every((p) => typeof p.raw_score === 'number'), `13. every online grade row carries raw_score (individual cost)`)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PASS C — the mock guest lies on purpose, and the matcher must refuse to believe it.
+async function contractFlow() {
+  banner('CONTRACT (pass C) — D6 refuses a hand-off with a seat missing; D10 refuses malformed results')
+  const gid = `e2e-contract-${Date.now()}`
+  await setMode(gid, 'on')
+  await syncRoster(gid)
+  const code = (await genCode(gid)).result.code
+  for (const pid of ['stu1', 'stu2', 'stu3', 'stu4']) {
+    await assignRole(gid, pid); await confirmReady(gid, pid); await verifyAttend(gid, pid, code); await beOnThePage(gid, pid)
+  }
+  const mm = await matchNow(gid); check(mm.ok, `1. triggerMatching — ${mm.ok ? 'ok' : mm.error}`)
+  const roster = await getRoster(gid)
+  const grp = roster.result?.groups?.find((g) => (g.participants_by_role?.player ?? []).length > 0)
+
+  // D6: the guest silently leaves one posted member out of seats[].
+  mockMode = 'drop-seat'
+  finalizeRequests.length = 0
+  const bad = await startAll(gid)
+  check(!bad.ok, `2. hand-off with a posted member left unseated is REFUSED (D6) — ${bad.ok ? `ACCEPTED, started ${bad.result?.started}` : bad.error}`)
+  const g1 = grp ? await groupDoc(gid, grp.group_id) : null
+  check(!!g1 && !g1.gameCode && !g1.locked, `3. …the group was NOT coded or locked, so no student is sent to a dead link`)
+  check(finalizeRequests.length === 1, `4. …and the orphaned guest session was ended — finalize calls: ${finalizeRequests.length}`)
+
+  // Recovery: the same button, an honest guest.
+  mockMode = 'ok'
+  const good = await startAll(gid)
+  check(good.ok && good.result.started === 1, `5. re-press with an honest guest hands off — started ${good.result?.started ?? good.error}`)
+
+  // D10: a wrong-SHAPED results reply must stop grading loudly, before anything is pushed.
+  mockMode = 'malformed-results'
+  gradePushes = []
+  const sr = await scoreAndRecord(gid)
+  check(!sr.ok && /malformed/i.test(sr.error ?? ''), `6. malformed results REFUSE the grading run, with the reason (D10) — ${sr.ok ? 'GRADED ANYWAY' : sr.error}`)
+  check(gradePushes.length === 0, `7. …and nothing reached the gradebook — pushes: ${gradePushes.length}`)
+  mockMode = 'ok'
+  const sr2 = await scoreAndRecord(gid)
+  check(sr2.ok && sr2.result.scored === 4, `8. honest results, same button: graded — scored ${sr2.result?.scored ?? sr2.error}`)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -433,6 +517,7 @@ async function main() {
     await classroomFlow()
     await shortGroupFlow()
     await onlineFlow()
+    await contractFlow()
   } catch (e) {
     FAIL++; console.error('HARNESS ERROR', e)
   } finally {

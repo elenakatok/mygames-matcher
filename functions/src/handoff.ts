@@ -124,12 +124,62 @@ export async function getGuestResults(gameCode: string): Promise<GuestResults> {
   if (!(res.status >= 200 && res.status < 300)) {
     throw new Error(`results failed for ${gameCode}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   }
-  const out = (await res.json()) as Partial<GuestResults>;
+  const out = await res.json().catch(() => null);
+  if (out === null) {
+    throw new MalformedGuestResultsError(`getClassResults for ${gameCode} is malformed: the reply is not JSON`);
+  }
   assertGuestVersion("getGuestResults", out);
+  return parseGuestResults(gameCode, out);
+}
+
+/**
+ * A getClassResults reply that does not have the contract's shape.
+ *
+ * D10 — "Malformed results fail loudly. Today a wrong-shaped 200 degrades to teams: [] /
+ * players: [], which grades an entire class as absent and looks like a class that did not
+ * play." Its own class so scoreAndRecord can tell a SHAPE regression (it hits every session
+ * the guest serves, so grade nothing) from one session it could not reach (the rest can
+ * still be read, as before).
+ */
+export class MalformedGuestResultsError extends Error {}
+
+/** Validate the whole reply and never coerce. Every field scoreAndRecord reads is checked. */
+function parseGuestResults(gameCode: string, out: unknown): GuestResults {
+  const fail = (why: string): MalformedGuestResultsError =>
+    new MalformedGuestResultsError(`getClassResults for ${gameCode} is malformed: ${why}`);
+  if (!out || typeof out !== "object") throw fail("the reply is not a JSON object");
+  const o = out as Record<string, unknown>;
+  if (o["ok"] !== true) throw fail(`ok is ${JSON.stringify(o["ok"])}, not true`);
+  if (o["gameCode"] !== gameCode) throw fail(`it answers for ${JSON.stringify(o["gameCode"])}`);
+  if (!Array.isArray(o["teams"])) throw fail("teams is not an array");
+  if (!Array.isArray(o["players"])) throw fail("players is not an array");
+  // A provisioned session always holds at least one human (D5 refuses an empty group), so an
+  // empty players[] is exactly the "class that did not play" D10 exists to stop.
+  if ((o["players"] as unknown[]).length === 0) throw fail("players is empty for a provisioned session");
+  const isNum = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v);
+  const numOrNull = (v: unknown): boolean => v === null || isNum(v);
+  const strOrNull = (v: unknown): boolean => v === null || typeof v === "string";
+  (o["teams"] as unknown[]).forEach((t, i) => {
+    const r = (t ?? {}) as Record<string, unknown>;
+    if (typeof r["teamId"] !== "string" || !r["teamId"]) throw fail(`teams[${i}].teamId is missing`);
+    if (typeof r["teamName"] !== "string") throw fail(`teams[${i}].teamName is not a string`);
+    if (!isNum(r["teamCost"])) throw fail(`teams[${i}].teamCost is not a number`);
+  });
+  (o["players"] as unknown[]).forEach((p, i) => {
+    const r = (p ?? {}) as Record<string, unknown>;
+    if (typeof r["studentId"] !== "string" || !r["studentId"]) throw fail(`players[${i}].studentId is missing`);
+    if (typeof r["participated"] !== "boolean") throw fail(`players[${i}].participated is not a boolean`);
+    if (!strOrNull(r["role"]) || !strOrNull(r["teamId"]) || !strOrNull(r["teamName"])) {
+      throw fail(`players[${i}] role/teamId/teamName must be string or null`);
+    }
+    if (!numOrNull(r["teamCost"]) || !numOrNull(r["individualCost"])) {
+      throw fail(`players[${i}] teamCost/individualCost must be number or null`);
+    }
+  });
   return {
     gameCode,
-    teams: Array.isArray(out.teams) ? out.teams : [],
-    players: Array.isArray(out.players) ? out.players : [],
+    teams: o["teams"] as GuestResults["teams"],
+    players: o["players"] as GuestResultPlayer[],
   };
 }
 
@@ -141,25 +191,19 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
   const g = snap.data() as Record<string, unknown>;
   if (g["gameCode"]) return; // already handed off
 
-  const seats = Array.isArray(g["player_participants"]) ? (g["player_participants"] as string[]) : [];
+  const seatIds = Array.isArray(g["player_participants"]) ? (g["player_participants"] as string[]) : [];
   const bots = new Set(Array.isArray(g["bot_participants"]) ? (g["bot_participants"] as string[]) : []);
 
-  const partCol = db().collection("game_instances").doc(iid).collection("participants");
-  const members: Array<{ studentId: string; displayName: string }> = [];
-  for (const pid of seats) {
-    if (bots.has(pid)) continue; // matcher-bot → guest game bot-fills instead
-    const p = (await partCol.doc(pid).get()).data() ?? {};
-    // ⚠ `display_name` is only set once a participant has been through online grouping;
-    // syncRoster (and in-class matching) writes the roster `name`, not `display_name`. Reading
-    // display_name ALONE fell back to the raw pid, so students showed up in the Beer Game as
-    // "dNkRCOmr1BlvOzTuxxuR". Fall back name-first, exactly like the shared displayNameOf.
-    const displayName =
-      (typeof p["display_name"] === "string" && p["display_name"].trim()) ? (p["display_name"] as string) :
-      (typeof p["name"] === "string" && (p["name"] as string).trim()) ? (p["name"] as string) :
-      pid;
-    members.push({ studentId: pid, displayName });
-  }
-  if (members.length === 0) return;
+  // Matcher-bots are NOT posted: the guest bot-fills the seats they held, and says so (D5).
+  // ⚠ D4 — "displayName is removed from the provision body. It is the only PII on the wire.
+  // It flows one way and once, nothing reads it back across the boundary, and the guest
+  // already falls back to studentId when it is absent." A member is { studentId } and
+  // nothing else, so no student name enters a project outside Elena's control; the real
+  // names stay on the matcher dashboard, on our side of the boundary. (This also drops a
+  // Firestore read per member that existed only to look the names up.)
+  const memberIds = seatIds.filter((pid) => !bots.has(pid));
+  if (memberIds.length === 0) return;
+  const members = memberIds.map((studentId) => ({ studentId }));
 
   // ⚠ EMULATOR ONLY: let the e2e harness point the hand-off at a mock provisioning
   // endpoint. Gated on FUNCTIONS_EMULATOR so a deployed matcher can NEVER be redirected
@@ -179,6 +223,10 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
     },
     body: JSON.stringify({
       contract_version: CONTRACT_VERSION,
+      // D5 — "The expected seat count is sent explicitly, and a mismatch is an error." The
+      // guest refuses a seat count it does not have, rather than truncating or bot-filling
+      // around a number the two sides never agreed.
+      seatCount: t.groupSize,
       instanceId: iid,
       groups: [{ groupId, members }],
       config,
@@ -187,9 +235,19 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
   if (!(res.status >= 200 && res.status < 300)) {
     throw new Error(`hand-off failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   }
-  const out = (await res.json()) as { gameCode?: string };
+  const out = ((await res.json().catch(() => null)) ?? {}) as Record<string, unknown>;
   assertGuestVersion("provisionGroupToTenant", out);
-  if (!out.gameCode) throw new Error("hand-off returned no gameCode");
+
+  // D6 — verify the reply BEFORE recording anything. A group that reaches the student
+  // redirect with a seat missing hands a student a link that dead-ends.
+  const problem = verifyProvisionReply(out, groupId, memberIds, t.groupSize);
+  if (problem) {
+    // Best-effort: end the session the guest just created so it does not sit in_progress for
+    // 30 days holding seats nobody will be sent to. Never masks the real error.
+    if (typeof out["gameCode"] === "string") await finalizeGuestSession(out["gameCode"]).catch(() => {});
+    throw new Error(`hand-off verification failed (D6): ${problem}`);
+  }
+  const gameCode = out["gameCode"] as string;
 
   // ⚠ `seats_locked_at` is what the STAGE ADAPTER reads for "this group has started"
   // (groupDocAdapter.hasStarted → seats_locked_at != null). Setting it at hand-off is the
@@ -198,14 +256,71 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
   // lock) both gate on this flag, so without it an instructor could re-form a group whose
   // students are already playing the Beer Game, orphaning them. `gameCode` drives the
   // student redirect and the "running" set; `seats_locked_at` drives the seat lock.
+  // `report_url` (D12): the instructor's report link, built HERE from the one play origin
+  // (tenants.ts playUrl) and stored beside the code, so the frontend no longer keeps a second
+  // copy of the guest's origin (VITE_PLAY_URL) that could drift from the one students use.
   await groupRef.set(
     {
-      gameCode: out.gameCode,
+      gameCode,
+      report_url: reportLinkFor(gameCode),
       handed_off_at: FieldValue.serverTimestamp(),
       seats_locked_at: FieldValue.serverTimestamp(),
     },
     { merge: true },
   );
+}
+
+const GAME_CODE_RE = /^[A-Z2-9]{4,8}$/;
+
+/**
+ * D6 — "The matcher verifies the seats array the guest returns. The guest already returns
+ * it; the matcher currently discards it."
+ *
+ * Returns null when the reply accounts for every seat, or one sentence naming what is
+ * wrong. Checks: a contract-shaped gameCode; the seatCount echoed back; every posted member
+ * seated EXACTLY once, in this group, and nobody else seated; and the guest's own report of
+ * how many seats went to humans and to bots (D5) agreeing with what the matcher sent.
+ */
+export function verifyProvisionReply(
+  out: Record<string, unknown>,
+  groupId: string,
+  memberIds: string[],
+  seatCount: number,
+): string | null {
+  const code = out["gameCode"];
+  if (typeof code !== "string" || !GAME_CODE_RE.test(code)) {
+    return `gameCode ${JSON.stringify(code)} is not a contract game code (/^[A-Z2-9]{4,8}$/)`;
+  }
+  if (out["seatCount"] !== seatCount) {
+    return `the guest echoed seatCount ${JSON.stringify(out["seatCount"])}; the matcher sent ${seatCount}`;
+  }
+  if (!Array.isArray(out["seats"])) return "the reply carries no seats[]";
+  const posted = new Set(memberIds);
+  const seated = new Set<string>();
+  for (const s of out["seats"] as Array<Record<string, unknown> | null>) {
+    const sid = s?.["studentId"];
+    if (typeof sid !== "string" || !posted.has(sid)) {
+      return `the guest seated a student the matcher never posted (${JSON.stringify(sid)})`;
+    }
+    if (seated.has(sid)) return `the guest seated ${sid} twice`;
+    if (s?.["groupId"] !== groupId) {
+      return `the seat for ${sid} is in group ${JSON.stringify(s?.["groupId"])}, not ${groupId}`;
+    }
+    seated.add(sid);
+  }
+  const unseated = memberIds.filter((id) => !seated.has(id));
+  if (unseated.length) return `${unseated.length} posted member(s) got no seat: ${unseated.join(", ")}`;
+  const report = Array.isArray(out["groups"])
+    ? (out["groups"] as Array<Record<string, unknown> | null>).find((r) => r?.["groupId"] === groupId)
+    : undefined;
+  if (!report) return "the reply carries no groups[] report for this group";
+  const wantBots = seatCount - memberIds.length;
+  if (report["humanSeats"] !== memberIds.length || report["botSeats"] !== wantBots) {
+    return `the guest reports ${JSON.stringify(report["humanSeats"])} human + ` +
+      `${JSON.stringify(report["botSeats"])} bot seat(s); the matcher sent ${memberIds.length} ` +
+      `human(s) for ${seatCount} seats (${wantBots} bot)`;
+  }
+  return null;
 }
 
 /**
@@ -241,15 +356,27 @@ async function buildGuestConfig(iid: string): Promise<Record<string, unknown>> {
  * credential — the guest refuses it. That is why this function, which used to have no
  * caller at all (the matcher frontend built the URL itself), is now the ONLY place a play
  * link is made: the HMAC needs the shared secret, and the browser must never hold it.
- * (Collapsing the frontend's now-unused copy is D12, pass C.)
+ *
+ * D12 — "One source of truth for the play URL." Done in pass C: the frontend's copy (and its
+ * VITE_PLAY_URL base) is deleted, and the instructor report link below is built from the
+ * same tenants.ts playUrl. This file is now the only place the guest's origin is read.
  */
+function playBase(): string {
+  return ACTIVE_TENANT.handoff.playUrl.replace(/\/$/, "");
+}
+
 export function playLinkFor(gameCode: string, participantId: string, seatToken: string): string {
-  const base = ACTIVE_TENANT.handoff.playUrl.replace(/\/$/, "");
+  const base = playBase();
   return (
     `${base}/?class=${encodeURIComponent(gameCode)}` +
     `&sid=${encodeURIComponent(participantId)}` +
     `&t=${encodeURIComponent(seatToken)}`
   );
+}
+
+/** The instructor's read-only report page for one handed-off session (orders + inventory). */
+export function reportLinkFor(gameCode: string): string {
+  return `${playBase()}/?report=${encodeURIComponent(gameCode)}`;
 }
 
 /**

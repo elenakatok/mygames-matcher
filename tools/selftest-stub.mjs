@@ -10,31 +10,39 @@
 // §5.4: "It must ship with the deliberate failing mode from (2) so he can prove his copy
 // bites before trusting it."
 //
-// THREE SCENARIOS, because the defects are mutually exclusive — a guest cannot both omit
-// contract_version and report v1 in the same run:
+// ONE SCENARIO PER DEFECT, because the defects are mutually exclusive — a guest cannot both
+// omit contract_version and report v1 in the same run. Outside its own defect, every variant
+// implements the FROZEN v1 (pass C included), so each defect shows up in its own assertions
+// instead of spraying unrelated reds.
 //
-//   classic    v1-correct EXCEPT the three §5.2 defects:
-//                1. any Bearer accepted        → "wrong secret → 401" must go red
-//                2. issues `BEER001`           → the game-code regex must go red
-//                3. drops the last member      → the seat-coverage check must go red
-//   no-version otherwise correct, but never emits contract_version
-//                                              → "guest reports contract_version 1" red
+//   conformant  NO defect — the harness must produce zero failures against it
+//   classic     v1-correct EXCEPT the three §5.2 defects:
+//                 1. any Bearer accepted        → "wrong secret → 401" must go red
+//                 2. issues `BEER001`           → the game-code regex must go red
+//                 3. drops the last member      → the seat-coverage check must go red
+//   no-version  never emits contract_version    → "guest reports contract_version 1" red
 //   accepts-unsigned  grants a seat with no token at all
 //   accepts-expired   verifies the signature but ignores `exp`
-//   lying-v1   reports contract_version 1 but still answers a bad game code with an
-//              unstructured 500 — the exact pre-D8 behaviour production had on 2026-09-09
-//                                              → the v1 bad-code checks must go red
+//   lying-v1    reports v1 but answers a bad game code with an unstructured 500 — the exact
+//               pre-D8 behaviour production had on 2026-09-09
+//   ── pass C (D4, D5) ──
+//   undeclared-seat-count  no seat-count field at all — the PRE-PASS-C shape, still v1
+//   ignores-seat-count     declares a seat count, then accepts any other
+//   truncates-overfull     slices an over-full group to its seats, silently (2026-09-09)
+//   skips-missing-id       skips a member with no studentId, silently (2026-09-09)
+//   silent-botfill         bot-fills an under-full group without saying so (found on
+//                          production 2026-09-09, missed by the extract)
+//   echoes-name            stores the displayName it was sent and hands it back (D4's PII)
 //
-// That last one is the whole point of version-keying the expectations: under a hardcoded
-// baseline a 500 was "known-current" forever and nobody had to notice. Under v1 the guest
-// has DECLARED it implements D8, so the same 500 is a violation and fails on its own.
+// That lying-v1 case is the whole point of version-keying the expectations: under a
+// hardcoded baseline a 500 was "known-current" forever and nobody had to notice. Under v1
+// the guest has DECLARED it implements D8, so the same 500 is a violation.
 
 import http from "node:http";
 import * as crypto from "node:crypto";
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
 const CONTRACT_VERSION = 1;
-const SEAT_SECRET_UNUSED_BY_LAX_VARIANTS = null; // documents that laxity is the defect
 
 /** The secret the self-test presents. Not a credential — these stubs are local and fake. */
 export const SELFTEST_SECRET = "selftest-secret-not-a-credential";
@@ -43,9 +51,11 @@ function makeServer(variant) {
   const sessions = new Map();
   let codeCounter = 0;
   const emitsVersion = variant !== "no-version";
+  // The pre-pass-C shape: no seatCount in, none echoed, no per-group report out.
+  const declaresSeats = variant !== "undeclared-seat-count";
 
   const body = (obj) => (emitsVersion ? { contract_version: CONTRACT_VERSION, ...obj } : obj);
-  const errBody = (code, message) => body({ error: { code, message } });
+  const errBody = (code, message, extra = {}) => body({ error: { code, message, ...extra } });
 
   return http.createServer((req, res) => {
     let raw = "";
@@ -55,7 +65,7 @@ function makeServer(variant) {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(typeof obj === "string" ? obj : JSON.stringify(obj));
       };
-      const sendErr = (status, code, message) => send(status, errBody(code, message));
+      const sendErr = (status, code, message, extra) => send(status, errBody(code, message, extra));
       const url = (req.url || "").split("?")[0];
 
       if (req.method !== "POST") return sendErr(405, "METHOD_NOT_ALLOWED", "POST only.");
@@ -93,30 +103,95 @@ function makeServer(variant) {
       const validCode = (c) => /^[A-Z2-9]{4,8}$/.test(String(c ?? "").trim().toUpperCase());
 
       if (url.endsWith("/provisionClassSession")) {
+        // D5 — the seat count, checked BEFORE groups[] exactly as the real guest does, so the
+        // harness's discovery probe (empty groups[], no seatCount) learns it without a write.
+        if (declaresSeats) {
+          const sc = parsed?.seatCount;
+          if (sc === undefined || sc === null) {
+            return sendErr(400, "SEAT_COUNT_REQUIRED", "seatCount is required.",
+              { expectedSeatCount: ROLES.length });
+          }
+          // DEFECT (ignores-seat-count): declares its count, never compares the one it got.
+          if (variant !== "ignores-seat-count" && sc !== ROLES.length) {
+            return sendErr(400, "SEAT_COUNT_MISMATCH", `seatCount ${String(sc)} is not ${ROLES.length}.`,
+              { expectedSeatCount: ROLES.length });
+          }
+        }
+
         const groups = Array.isArray(parsed?.groups) ? parsed.groups : null;
         if (!groups || groups.length === 0) {
           return sendErr(400, "GROUPS_REQUIRED", "groups[] is required and must be non-empty.");
         }
-        const g = groups[0];
-        const posted = Array.isArray(g.members) ? g.members : [];
-        // DEFECT 3 (classic): drop the last posted member, silently.
-        // ⚠ Applied ONLY to a group of exactly ROLES.length — the happy-path arc. The
-        // negative suite's under/over-full probes stay in-contract so this defect shows up
-        // in one assertion instead of spraying unrelated reds and muddying the proof.
-        const full = posted.length === ROLES.length;
-        const placed = variant === "classic" && full
-          ? posted.slice(0, ROLES.length - 1)
-          : posted.slice(0, ROLES.length);
+
+        // Validate the whole request before creating anything — in-contract unless the
+        // variant's own defect says otherwise.
+        const seen = new Set();
+        const plans = [];
+        for (let gi = 0; gi < groups.length; gi += 1) {
+          const g = groups[gi] ?? {};
+          const groupId = typeof g.groupId === "string" && g.groupId ? g.groupId : `group-${gi + 1}`;
+          let posted = Array.isArray(g.members) ? g.members : [];
+          if (posted.length === 0) return sendErr(400, "GROUP_EMPTY", `groups[${gi}] has no members.`);
+          if (posted.length > ROLES.length) {
+            // DEFECT (truncates-overfull): the 2026-09-09 behaviour — slice to the seat count,
+            // say nothing, and leave the dropped student holding a link that dead-ends.
+            if (variant !== "truncates-overfull") {
+              return sendErr(400, "GROUP_OVERFULL", `groups[${gi}] has ${posted.length} members.`,
+                { expectedSeatCount: ROLES.length });
+            }
+            posted = posted.slice(0, ROLES.length);
+          }
+          const people = [];
+          for (let mi = 0; mi < posted.length; mi += 1) {
+            const sid = typeof posted[mi]?.studentId === "string" ? posted[mi].studentId.trim() : "";
+            if (!sid) {
+              // DEFECT (skips-missing-id): skip the nameless member silently, as the
+              // pre-pass-C guest did.
+              if (variant === "skips-missing-id") continue;
+              return sendErr(400, "MEMBER_STUDENT_ID_REQUIRED", `groups[${gi}].members[${mi}] has no studentId.`);
+            }
+            if (seen.has(sid)) return sendErr(400, "DUPLICATE_STUDENT_ID", `${sid} appears twice.`);
+            seen.add(sid);
+            people.push({ sid, displayName: posted[mi]?.displayName });
+          }
+          plans.push({ groupId, people });
+        }
+
         // DEFECT 2 (classic): the mock's own out-of-spec code shape (contains 0 and 1).
         const code = variant === "classic"
           ? `BEER${String(++codeCounter).padStart(3, "0")}`
           : Array.from({ length: 6 }, () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 32)]).join("");
-        const seats = placed.map((m, i) => ({
-          studentId: m.studentId, role: ROLES[i], teamId: "team1",
-          playerId: `p${i + 1}`, groupId: g.groupId ?? "group-1",
-        }));
+
+        const seats = [];
+        const reports = [];
+        plans.forEach((p, gi) => {
+          const teamId = `team${gi + 1}`;
+          // DEFECT 3 (classic): drop the last member of a FULL group, silently. Only a full
+          // group — the happy-path arc — so the defect lands in one assertion instead of
+          // spraying the negative suite's under/over-full probes.
+          const placed = variant === "classic" && p.people.length === ROLES.length
+            ? p.people.slice(0, ROLES.length - 1)
+            : p.people;
+          placed.forEach((m, i) => seats.push({
+            studentId: m.sid, role: ROLES[i], teamId, playerId: `p${gi + 1}-${i + 1}`, groupId: p.groupId,
+            // DEFECT (echoes-name): keeps the stray displayName, as the pre-pass-C guest did.
+            _name: variant === "echoes-name" ? (m.displayName ?? null) : null,
+          }));
+          reports.push({
+            groupId: p.groupId, teamId, humanSeats: placed.length,
+            botSeats: ROLES.length - placed.length, botRoles: ROLES.slice(placed.length),
+          });
+        });
         sessions.set(code, { seats, ended: false });
-        return send(200, body({ gameCode: code, seats }));
+
+        return send(200, body({
+          gameCode: code,
+          ...(declaresSeats ? { seatCount: ROLES.length } : {}),
+          seats: seats.map(({ _name, ...s }) => s),
+          // DEFECT (silent-botfill): nothing in the reply says a seat went to a bot — the
+          // production finding of 2026-09-09.
+          ...(declaresSeats && variant !== "silent-botfill" ? { groups: reports } : {}),
+        }));
       }
 
       if (url.endsWith("/finalizeClassSession") || url.endsWith("/getClassResults")) {
@@ -147,7 +222,7 @@ function makeServer(variant) {
           costByRole: { retailer: 300, wholesaler: 300, distributor: 300, factory: 334 },
         }];
         const players = s.seats.map((seat) => ({
-          studentId: seat.studentId, role: seat.role, teamId: "team1",
+          studentId: seat.studentId, role: seat.role, teamId: seat.teamId,
           teamName: "Selftest Team", teamCost: 1234, individualCost: 300, participated: true,
         }));
         return send(200, body({ ok: true, gameCode: code, teams, players }));
@@ -183,8 +258,9 @@ function makeServer(variant) {
         const seat = s2?.seats.find((x) => x.studentId === studentId);
         if (!seat) return sendErr(404, "SEAT_NOT_FOUND", "No seat for this student.");
         return send(200, body({
-          playerId: seat.playerId, role: seat.role, teamId: seat.teamId,
-          teamName: "Selftest Team", name: `Selftest ${studentId}`,
+          playerId: seat.playerId, role: seat.role, teamId: seat.teamId, teamName: "Selftest Team",
+          // D4: the frozen v1 returns NO name. Only the echoes-name defect hands one back.
+          ...(variant === "echoes-name" ? { name: seat._name } : {}),
           sessionToken: crypto.randomBytes(12).toString("hex"),
         }));
       }
@@ -206,11 +282,22 @@ export function startSelfTestStub(variant = "classic") {
 
 /**
  * The scenarios --self-test runs, and the assertions that MUST come back FAIL in each.
- * Names match guest-conformance.mjs exactly. If the harness stops producing one, --self-test
- * reports it MISSING rather than quietly passing — a renamed assertion is how an instrument
- * proof rots into a rubber stamp.
+ * ⚠ THIS LIST IS THE EXPECTED-FAILURES CONTRACT. Names match guest-conformance.mjs EXACTLY.
+ * If the harness stops producing one, --self-test reports it MISSING and exits non-zero
+ * rather than quietly passing — a renamed assertion is how an instrument proof rots into a
+ * rubber stamp. That is why no name below contains a number the harness computes (a seat
+ * count, a stamp): a name that varies per run could never be matched.
  */
 export const SELFTEST_SCENARIOS = [
+  {
+    // NO DEFECT. The frozen v1, implemented correctly. The harness must report ZERO failures
+    // here — this is the half of the proof the defect scenarios cannot give: that a green
+    // run means something because the harness does not cry wolf at a correct guest.
+    variant: "conformant",
+    what: "no defect — the frozen v1 done right; the harness must stay entirely green",
+    expectedFailures: [],
+    expectClean: true,
+  },
   {
     variant: "classic",
     what: "§5.2's three probes: wrong secret, malformed game code, missing member",
@@ -250,6 +337,54 @@ export const SELFTEST_SCENARIOS = [
     expectedFailures: [
       "game code containing 0/1 ('BEER01') → 400",
       "…and its body is structured JSON with a stable code",
+    ],
+  },
+  // ── pass C ──────────────────────────────────────────────────────────────────────
+  {
+    variant: "undeclared-seat-count",
+    what: "D5: a guest with no seat-count field at all — v1 in number, pre-pass-C in shape",
+    expectedFailures: [
+      // Same shape as accepts-unsigned: an undeclared count skips the D5 probes, so what
+      // must go red is the guard that names the missing declaration.
+      "guest declares its seat count (D5)",
+    ],
+  },
+  {
+    variant: "ignores-seat-count",
+    what: "D5: a guest that declares its seat count but accepts any other",
+    expectedFailures: [
+      "seatCount mismatch → 400 SEAT_COUNT_MISMATCH",
+      "seatCount mismatch — nothing was provisioned",
+    ],
+  },
+  {
+    variant: "truncates-overfull",
+    what: "D5: a guest that silently truncates an over-full group (2026-09-09)",
+    expectedFailures: [
+      "over-full group → 400 GROUP_OVERFULL",
+      "over-full group — nothing was provisioned",
+    ],
+  },
+  {
+    variant: "skips-missing-id",
+    what: "D5: a guest that silently skips a member with no studentId (2026-09-09)",
+    expectedFailures: [
+      "member with no studentId → 400 MEMBER_STUDENT_ID_REQUIRED",
+    ],
+  },
+  {
+    variant: "silent-botfill",
+    what: "D5: a guest that bot-fills without saying so (found on production 2026-09-09)",
+    expectedFailures: [
+      "provision reports each group's human and bot seats",
+      "under-full group reports its bot-filled seats (botSeats = seatCount − members)",
+    ],
+  },
+  {
+    variant: "echoes-name",
+    what: "D4: a guest that keeps the displayName it was sent and hands it back",
+    expectedFailures: [
+      "the seat claim carries no student name (D4 — no name field, planted canary absent)",
     ],
   },
 ];

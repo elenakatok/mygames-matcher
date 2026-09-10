@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { signInWithCustomToken, signOut, setPersistence, browserSessionPersistence } from 'firebase/auth'
 import { collection, onSnapshot } from 'firebase/firestore'
 import { authInstructor, dbInstructor } from '../firebase'
-import { getInstructorSession, reportLinkFor, CLASSROOM_URL } from '../api'
+import { getInstructorSession, CLASSROOM_URL } from '../api'
 import { colors, typography, spacing, layout, GameHeader } from '@mygames/game-ui'
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -12,7 +12,9 @@ import { colors, typography, spacing, layout, GameHeader } from '@mygames/game-u
 // Reports.tsx "By group (selector)"). The report CONTENT lives in the Beer Game (its own
 // project), so it is embedded in an <iframe> pointing at the Beer Game's read-only report
 // page (?report=<gameCode>). Only groups that have been HANDED OFF (carry a gameCode) have a
-// report; the dropdown lists exactly those.
+// report; the dropdown lists exactly those. The iframe URL is the group doc's `report_url`,
+// written by the hand-off from the matcher's single play origin (D12) — this page never
+// builds one, so it cannot drift from where students are sent.
 //
 // Session: this page needs the instructor session to read the group docs. It resumes the
 // existing instructor_<gid> session (the dashboard navigates here in-SPA, so it is already
@@ -20,7 +22,7 @@ import { colors, typography, spacing, layout, GameHeader } from '@mygames/game-u
 // uses, so a cold load / refresh of /reports still works.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-type Group = { number: number; gameCode: string }
+type Group = { number: number; gameCode: string; reportUrl: string }
 
 export default function MatcherReports() {
   const p       = new URLSearchParams(window.location.search)
@@ -77,8 +79,14 @@ export default function MatcherReports() {
         const sorted = snap.docs.slice().sort((a, b) => a.id.localeCompare(b.id))
         const list: Group[] = []
         sorted.forEach((d, i) => {
-          const code = (d.data() as Record<string, unknown>)['gameCode']
-          if (typeof code === 'string' && code) list.push({ number: i + 1, gameCode: code })
+          const data = d.data() as Record<string, unknown>
+          const code = data['gameCode']
+          const url = data['report_url']
+          // D12: a group handed off before pass C has no report_url. It is listed with no
+          // report rather than rebuilt from a second copy of the origin (D1: no shim).
+          if (typeof code === 'string' && code) {
+            list.push({ number: i + 1, gameCode: code, reportUrl: typeof url === 'string' ? url : '' })
+          }
         })
         setGroups(list)
         setSel((s) => (s < list.length ? s : 0))
@@ -88,7 +96,7 @@ export default function MatcherReports() {
     return () => unsub()
   }, [ready, gid])
 
-  const iframeSrc = useMemo(() => (groups[sel] ? reportLinkFor(groups[sel].gameCode) : null), [groups, sel])
+  const iframeSrc = useMemo(() => (groups[sel]?.reportUrl ? groups[sel].reportUrl : null), [groups, sel])
 
   const mainWrap: React.CSSProperties = { maxWidth: 1000, margin: '0 auto', padding: layout.pagePad, fontFamily: typography.fontFamily }
 

@@ -20,14 +20,24 @@
 // is the harness watching the change happen, which is the point.
 //
 // ── WHAT IT DRIVES ────────────────────────────────────────────────────────────────────
-//   provision → build deep link → claim seat → finalize → finalize again → read results
+//   discover seat count → provision → build deep link → claim seat → finalize →
+//   finalize again → read results
 //
-// ── AUTH: TWO DIFFERENT MODELS, DELIBERATELY NOT UNIFIED ──────────────────────────────
+// ── AUTH: TWO MODELS, DELIBERATELY NOT UNIFIED ────────────────────────────────────────
 //   provisionClassSession / finalizeClassSession / getClassResults
 //       Authorization: Bearer <matcher's PROVISION_SECRET_BEERGAME>   (server-to-server)
 //   resumeClassPlayer
-//       an onCall — Firebase ANONYMOUS auth, envelope {"data":{...}}, NOT the shared
-//       secret. Forcing it into the bearer scheme would test a contract that doesn't exist.
+//       plain HTTP with NO Authorization header — the signed seat token the matcher mints
+//       is the whole credential (D2/D3). The student never carries the shared secret.
+//
+// ── PASS C: THE FROZEN v1 ─────────────────────────────────────────────────────────────
+// Pass C (D4 no displayName, D5 explicit seat count, D6 verifiable seats, D9 results guard)
+// changed payload shape WITHOUT bumping contract_version: nothing outside this project has
+// ever spoken the contract, so a bump would invent version history for revisions nobody
+// used. v1 freezes when the contract document ships. So the version CANNOT select pass C's
+// expectations — and this file does not try. v1's expectations ARE the frozen v1; a guest
+// that predates pass C fails them, and detectSeatCount() makes that failure name itself in
+// one line instead of a dozen unexplained reds.
 //
 // ── SECRETS ───────────────────────────────────────────────────────────────────────────
 // The harness acts as the MATCHER, so it needs the matcher's copy of the provision secret:
@@ -101,7 +111,7 @@ const EXPECTATIONS = {
   // v1 — what D7/D8 make true. Nothing here is a baseline; a v1 guest that misses any of
   // it is failing its own declared contract.
   1: {
-    label: "v1 (D7 contract_version + D8 structured errors)",
+    label: "v1 (frozen: D7/D8, D2/D3 seat tokens, pass C D4/D5/D6/D9)",
     versionEchoed: true,
     versionEnforced: true,
     errorShape: "object",          // { contract_version, error: { code, message } }
@@ -124,10 +134,12 @@ const ERROR_CODE_FOR = {
 const DEFAULTS = {
   baseUrl: "https://us-central1-beergame-mygames-live.cloudfunctions.net",
   playUrl: "https://beergame-mygames-live.web.app",
-  // The guest's seat count. The matcher declares groupSize: 4 (tenants.ts) and the guest
-  // has ROLES.length seats (engine.ts) — two independently-declared constants that nothing
-  // validates against each other. The negative suite probes that seam directly.
-  seats: 4,
+  // ⚠ NO SEAT COUNT HERE ANY MORE. It used to be `seats: 4` (overridable with --seats) — a
+  // THIRD copy of a number the matcher (groupSize) and the guest (ROLES.length) each declare
+  // independently, which meant the over-full probe could silently test the wrong boundary.
+  // D5 makes the guest DECLARE its seat count (error.expectedSeatCount on
+  // SEAT_COUNT_REQUIRED), so the harness reads it from the guest under test. See
+  // detectSeatCount().
 };
 
 function parseArgs(argv) {
@@ -144,7 +156,11 @@ function parseArgs(argv) {
     else if (a === "--json") out.json = true;
     else if (a === "--base-url") out.baseUrl = next().replace(/\/$/, "");
     else if (a === "--play-url") out.playUrl = next().replace(/\/$/, "");
-    else if (a === "--seats") out.seats = Number(next());
+    else if (a === "--seats") {
+      console.error("--seats is retired: the seat count is now read from the guest itself (D5). " +
+        "Remove the flag.");
+      process.exit(2);
+    }
     else if (a === "--api-key") out.apiKey = next();
     else if (a === "--api-key-file") out.apiKeyFile = next();
     else if (a === "--help" || a === "-h") { usage(); process.exit(0); }
@@ -172,7 +188,6 @@ guest-conformance.mjs — conformance harness against the REAL guest endpoints
                         Use only to record a pre-pass-B guest; by default that FAILS.
   --base-url <url>      guest functions origin   (default ${DEFAULTS.baseUrl})
   --play-url <url>      guest play origin        (default ${DEFAULTS.playUrl})
-  --seats <n>           expected guest seat count (default ${DEFAULTS.seats})
   --api-key <key>       Firebase Web API key for the guest project (public, in-bundle
                         value; needed ONLY to mint the anonymous token resumeClassPlayer
                         requires). Or set BEERGAME_WEB_API_KEY.
@@ -349,6 +364,27 @@ async function detectSeatTokenEnforced(baseUrl) {
 }
 
 /**
+ * D5 — "The expected seat count is sent explicitly, and a mismatch is an error." Ask the
+ * guest how many seats a group has, WITHOUT creating anything.
+ *
+ * The probe: a correctly authenticated, correctly versioned provision with NO seatCount and
+ * an EMPTY groups[]. A pass-C guest checks seatCount before groups[] and answers 400
+ * SEAT_COUNT_REQUIRED carrying an integer error.expectedSeatCount. A guest that predates
+ * pass C has no seat-count field and answers 400 GROUPS_REQUIRED instead — and the empty
+ * groups[] is what makes the probe safe on both: it is refused before anything is written.
+ *
+ * ⚠ Not a version selector. An undeclared seat count is a FAIL ("guest declares its seat
+ * count (D5)"); this function only lets the harness say WHY in one line.
+ */
+async function detectSeatCount(baseUrl, secret) {
+  const probe = await callGuest(baseUrl, "provisionClassSession", { groups: [] }, secret);
+  const n = probe.json?.error?.expectedSeatCount;
+  const declared = probe.status === 400 && probe.json?.error?.code === "SEAT_COUNT_REQUIRED" &&
+    Number.isInteger(n) && n > 0;
+  return { seatCount: declared ? n : null, probe };
+}
+
+/**
  * Assert an error body in whichever shape the detected version calls for:
  *   v0  { error: "not-found" }
  *   v1  { contract_version: 1, error: { code: "NOT_FOUND", message } }
@@ -418,21 +454,28 @@ async function runArc(opts, secret, expect) {
   const stamp = Date.now();
   const instanceId = `conformance-${stamp}`;
   const groupId = `cgroup-${stamp}`;
-  // ⚠ A unique canary as the display name. The extract says a student NAME crosses into
-  // the guest at provisioning and must NOT come back out through getClassResults. A
-  // distinctive string makes that assertion strong: we scan the entire results payload
-  // for it rather than checking a field we already expect to be absent.
+  // ⚠ D4 — "displayName is removed from the provision body. It is the only PII on the wire."
+  // The matcher no longer sends one. This harness DOES, deliberately, as a PLANTED CANARY:
+  // it is exactly what a buggy or older matcher would leak, and the frozen-v1 guest must
+  // neither store it nor hand it back. A distinctive string lets every later assertion scan
+  // a WHOLE payload for it rather than checking one field we already expect to be absent.
   const canary = `ZZCanary${stamp}`;
-  const members = Array.from({ length: opts.seats }, (_, i) => ({
+  // ⚠ Exactly the guest's DECLARED seat count (D5): a full group, so every seat is human and
+  // the bot report must say zero. With no declaration, ONE member — never over-full on any
+  // guest — and the D5 guard in main() has already failed by name.
+  const seatCount = expect.seatCount ?? null;
+  const n = seatCount ?? 1;
+  const members = Array.from({ length: n }, (_, i) => ({
     studentId: `${instanceId}-s${i + 1}`,
     displayName: `${canary}-${i + 1}`,
   }));
 
-  console.log(`\n── ARC ── instance ${instanceId}, ${members.length} members\n`);
+  console.log(`\n── ARC ── instance ${instanceId}, ${members.length} members, ` +
+    `seatCount ${seatCount ?? "(undeclared)"}\n`);
 
   // 1. provision ──────────────────────────────────────────────────────────────────────
   const prov = await callGuest(opts.baseUrl, "provisionClassSession",
-    { instanceId, groups: [{ groupId, members }], config: { nWeeks: 12, customerDemand: Array.from({ length: 12 }, (_, i) => (i < 4 ? 4 : 8)) } },
+    { instanceId, seatCount: n, groups: [{ groupId, members }], config: { nWeeks: 12, customerDemand: Array.from({ length: 12 }, (_, i) => (i < 4 ? 4 : 8)) } },
     secret);
 
   check("provision returns 2xx", prov.status >= 200 && prov.status < 300, `got HTTP ${prov.status}: ${prov.text.slice(0, 200)}`);
@@ -471,6 +514,20 @@ async function runArc(opts, secret, expect) {
   const unseated = members.filter((m) => !seatedIds.has(m.studentId));
   check("every posted member received a seat", unseated.length === 0,
     `${unseated.length} posted member(s) got no seat: ${unseated.map((m) => m.studentId).join(", ")}`);
+  check("no member was seated twice", seats.length === seatedIds.size,
+    `${seats.length} seats for ${seatedIds.size} distinct students`);
+
+  // ⚠ D5/D6 — the guest must SAY how it filled every seat, so the matcher can verify the
+  // hand-off instead of inferring it. This is a full group: every seat human, zero bots.
+  check("provision echoes the seatCount it was sent", prov.json?.seatCount === n,
+    `sent ${n}, got ${JSON.stringify(prov.json?.seatCount)}`);
+  const report = (Array.isArray(prov.json?.groups) ? prov.json.groups : [])
+    .find((g) => g?.groupId === groupId);
+  check("provision reports each group's human and bot seats",
+    Boolean(report) && report.humanSeats === members.length && report.botSeats === 0,
+    `got groups=${JSON.stringify(prov.json?.groups ?? null).slice(0, 200)}`);
+  check("the planted displayName canary is absent from the provision reply (D4)",
+    !prov.text.includes(canary), `canary '${canary}' echoed by provisionClassSession`);
 
   // 2. deep link ──────────────────────────────────────────────────────────────────────
   const target = seats[0];
@@ -509,9 +566,19 @@ async function runArc(opts, secret, expect) {
     check("seat claim echoes contract_version", claimed?.contract_version === CONTRACT_VERSION,
       `got ${JSON.stringify(claimed?.contract_version)}`);
   }
-  check("the display name we sent is returned by the seat claim (documents the PII crossing)",
-    typeof claimed?.name === "string" && claimed.name.includes(canary),
-    `got name='${claimed?.name}'`);
+  // ⚠ INVERTED BY PASS C. This line used to read "the display name we sent is returned by
+  // the seat claim (documents the PII crossing)" — and it PASSED BECAUSE THE DEFECT EXISTED.
+  // D4 takes the name off the wire, so the same observation must now come back ABSENT.
+  // Pass C stays at contract_version 1, so the version cannot select between the two; the
+  // old assertion is REPLACED outright rather than branched. There is no mode that expects
+  // the name back, because the frozen v1 never returns one.
+  // Conditioned on the claim SUCCEEDING — an error body has no name either, and must not
+  // pass this vacuously.
+  check("the seat claim carries no student name (D4 — no name field, planted canary absent)",
+    claim.status >= 200 && claim.status < 300 && claimed !== null &&
+      !("name" in claimed) && !claim.text.includes(canary),
+    `HTTP ${claim.status}; name=${JSON.stringify(claimed?.name)}; ` +
+    `canary ${claim.text.includes(canary) ? "PRESENT" : "absent"}`);
 
   // ── THE HIJACK PROBE, NOW INVERTED ──────────────────────────────────────────────────
   //
@@ -541,8 +608,14 @@ async function runArc(opts, secret, expect) {
 
     // A token minted for a DIFFERENT seat in the same session — the closest thing to a
     // realistic forgery, and it must not transfer.
-    const other = seats[1] ?? seats[0];
-    const wrongSeat = mintSeatToken(gameCode, other.studentId, secret);
+    // ⚠ Never fall back to the TARGET's own seat. With a one-seat group (a guest declaring
+    // seatCount 1, or the one-member arc a pre-pass-C guest gets) `seats[1]` does not exist,
+    // and the old `seats[1] ?? seats[0]` minted a token for the very seat being claimed — a
+    // VALID token, so the "refusal" was granted and two lines went red for a harness bug.
+    // The pass-C negative control caught it. Any other identity proves non-transfer.
+    const otherId = seats.find((s) => s.studentId !== target.studentId)?.studentId ??
+      `${target.studentId}-not-this-seat`;
+    const wrongSeat = mintSeatToken(gameCode, otherId, secret);
     const wrongRes = await callGuest(opts.baseUrl, "resumeClassPlayer",
       { gameCode, studentId: target.studentId, seatToken: wrongSeat }, null);
     check("token minted for ANOTHER seat is REFUSED", wrongRes.status === 401 &&
@@ -640,7 +713,11 @@ async function runNegative(opts, secret, expect) {
   checkErrorBody("405 body", get, "method-not-allowed", expect);
 
   // 3. empty groups[] → 400
-  const empty = await callGuest(opts.baseUrl, "provisionClassSession", { groups: [] }, secret);
+  // ⚠ Carries a VALID seatCount when the guest declared one. Pass C checks seatCount BEFORE
+  // groups[] (that order is what makes the discovery probe safe), so without it this probe
+  // never reaches the groups check — the first pass-C emulator run got SEAT_COUNT_REQUIRED here.
+  const empty = await callGuest(opts.baseUrl, "provisionClassSession",
+    { ...(expect.seatCount != null ? { seatCount: expect.seatCount } : {}), groups: [] }, secret);
   check("empty groups[] → 400", empty.status === 400, `got HTTP ${empty.status}: ${empty.text.slice(0, 160)}`);
   checkErrorBody("400 body", empty, "groups[] is required", expect);
 
@@ -701,79 +778,112 @@ async function runNegative(opts, secret, expect) {
   check("finalize on a never-provisioned code → 404", never.status === 404,
     `got HTTP ${never.status}: ${never.text.slice(0, 160)}`);
 
-  // 7. A MISSING MEMBER — §5.2 names this probe explicitly, and D5 is the change that
-  //    makes it an error. Two flavours, both silent today:
-  //      (a) an UNDER-FULL group: the guest bot-fills the gap and says nothing;
-  //      (b) a member object with no studentId: skipped outright at classroom.ts:198.
-  //    Recorded as baselines, not failures — today's behaviour is wrong but known, and
-  //    D5 ("expected seat count is sent explicitly, and a mismatch is an error") is what
-  //    changes it. When it does, these lines move and the harness says so.
-  const shortStamp = Date.now();
-  const shortId = `conformance-short-${shortStamp}`;
-  const shortMembers = Array.from({ length: Math.max(1, opts.seats - 1) }, (_, i) => ({
-    studentId: `${shortId}-s${i + 1}`,
-    displayName: `Short-${i + 1}`,
-  }));
-  const sh = await callGuest(opts.baseUrl, "provisionClassSession",
-    { instanceId: shortId, groups: [{ groupId: `sg-${shortStamp}`, members: shortMembers }] }, secret);
-  const shSeats = Array.isArray(sh.json?.seats) ? sh.json.seats : [];
-  baseline(`under-full group (${shortMembers.length} of ${opts.seats} seats) is accepted`,
-    sh.status >= 200 && sh.status < 300 ? "accepted" : `rejected ${sh.status}`,
-    "accepted", "rejected, or the seat count agreed explicitly (D5)");
-  check("under-full group seats exactly the members posted (rest bot-filled server-side)",
-    shSeats.length === shortMembers.length, `sent ${shortMembers.length}, seated ${shSeats.length}`);
-  record(BASELINE, "nothing in the response says a seat was bot-filled",
-    `body keys = ${Object.keys(sh.json ?? {}).join(",")}. The matcher cannot tell a fully ` +
-    `human group from one carrying a bot.`);
+  // 7. D5 — THE SEAT COUNT, MADE EXPLICIT ─────────────────────────────────────────────
+  // D5 — "The expected seat count is sent explicitly, and a mismatch is an error. Today the
+  // guest infers bot-fill from which seats came up empty, and this works only because the
+  // matcher's groupSize happens to equal the guest's ROLES.length. Nothing checks it."
+  //
+  // Until pass C these were FOUR KNOWN-CURRENT baselines, characterised on production on
+  // 2026-09-09: an under-full group accepted silently; an over-full group truncated with the
+  // dropped member reported nowhere; a member with no studentId skipped silently; and (found
+  // on production, missed by the extract) nothing in the reply saying a seat was bot-filled.
+  // Each is now an assertion. The design, stated here so it is not re-derived:
+  //   OVER-FULL   → REJECTED (GROUP_OVERFULL). There is no seat for the extra student; the
+  //                 old truncation handed him a working-looking link that dead-ended.
+  //   UNDER-FULL  → ACCEPTED AND REPORTED. It is the designed bot-fill path — the matcher
+  //                 posts humans only and the guest fills the rest — so rejecting it would
+  //                 break every group carrying a matcher placeholder. What was wrong was the
+  //                 SILENCE: the reply now says, per group, how many seats went to bots.
+  //   NO studentId, DUPLICATE studentId, EMPTY group → REJECTED, before anything is written.
+  // Every rejection is also checked for "nothing was provisioned", so a guest that errors
+  // AND creates a session cannot pass.
+  const N = expect.seatCount ?? null;
+  const probeCodes = [];
+  // ⚠ OMIT is a sentinel, NOT `undefined`. A default parameter swallows an explicit
+  // undefined, so `provision(tag, groups, undefined)` used to SEND seatCount = N — and the
+  // "no seatCount" probe provisioned a real session. The first pass-C emulator run caught it;
+  // the self-test could not, because it only proved defects go red, never that a correct
+  // guest stays green (the `conformant` scenario now proves that too).
+  const OMIT = Symbol("omit seatCount");
+  const provision = async (tag, groups, seatCount = N) => {
+    const r = await callGuest(opts.baseUrl, "provisionClassSession",
+      { instanceId: `conformance-${tag}-${Date.now()}`,
+        ...(seatCount === OMIT ? {} : { seatCount }), groups }, secret);
+    if (r.json?.gameCode) probeCodes.push(r.json.gameCode);
+    return r;
+  };
+  const people = (tag, k) => Array.from({ length: k }, (_, i) => ({ studentId: `conformance-${tag}-${Date.now()}-s${i + 1}` }));
+  const refused = (name, r, code) => {
+    check(`${name} → 400 ${code}`, r.status === 400 && r.json?.error?.code === code,
+      `got HTTP ${r.status}: ${r.text.slice(0, 200)}`);
+    check(`${name} — nothing was provisioned`, !r.json?.gameCode,
+      `a gameCode came back (${r.json?.gameCode}) — the request was accepted after all`);
+  };
 
-  const noIdStamp = Date.now();
-  const noIdInstance = `conformance-noid-${noIdStamp}`;
-  const noId = await callGuest(opts.baseUrl, "provisionClassSession",
-    { instanceId: noIdInstance, groups: [{ groupId: `ng-${noIdStamp}`, members: [
-      { studentId: `${noIdInstance}-ok`, displayName: "Present" },
-      { displayName: "NoStudentId" },
-    ] }] }, secret);
-  const noIdSeats = Array.isArray(noId.json?.seats) ? noId.json.seats : [];
-  baseline("member object with NO studentId is silently skipped",
-    noIdSeats.length === 1 ? "skipped-silently" : `seated ${noIdSeats.length}`,
-    "skipped-silently", "named in a structured error (D5/D8)");
-  for (const c of [sh.json?.gameCode, noId.json?.gameCode]) {
-    if (c) await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: c }, secret);
+  if (N === null) {
+    record(SKIP, "D5 seat-count probes",
+      "the guest declared no seat count, so there is no boundary to probe. " +
+      "The D5 guard has already failed by name.");
+  } else {
+    // (a) The declaration itself — the discovery probe, asserted as its own line.
+    const noCount = await provision("noseat", [{ members: people("noseat", N) }], OMIT);
+    refused("provision with NO seatCount", noCount, "SEAT_COUNT_REQUIRED");
+    check("…and the error declares the guest's seat count (error.expectedSeatCount)",
+      noCount.json?.error?.expectedSeatCount === N,
+      `got ${JSON.stringify(noCount.json?.error ?? null).slice(0, 160)}`);
+
+    // (b) A seat count the guest does not have — the coupling D5 makes explicit.
+    refused("seatCount mismatch", await provision("mismatch", [{ members: people("mismatch", N) }], N + 1),
+      "SEAT_COUNT_MISMATCH");
+
+    // (c) Over-full — rejected, never truncated. The boundary is the GUEST's declared
+    //     count + 1, so it cannot be the wrong boundary (the --seats risk, closed).
+    refused("over-full group", await provision("over", [{ members: people("over", N + 1) }]),
+      "GROUP_OVERFULL");
+
+    // (d) A member with no studentId — rejected, never skipped.
+    refused("member with no studentId",
+      await provision("noid", [{ members: [...people("noid", 1), { displayName: "NoStudentId" }] }]),
+      "MEMBER_STUDENT_ID_REQUIRED");
+
+    // (e) The same student twice — the two seats would collide on one seat lock.
+    const twice = people("dup", 1)[0];
+    refused("duplicate studentId", await provision("dup", [{ members: [twice, { ...twice }] }]),
+      "DUPLICATE_STUDENT_ID");
+
+    // (f) A group with nobody in it — a team of bots is not a class.
+    refused("group with no members", await provision("empty", [{ members: [] }]), "GROUP_EMPTY");
+
+    // (g) Under-full — accepted, and the bot-fill REPORTED.
+    if (N < 2) {
+      record(SKIP, "under-full group probes", `the guest seats ${N}; a group cannot be under-full.`);
+    } else {
+      const ug = `ug-${Date.now()}`;
+      const few = people("under", N - 1);
+      const under = await provision("under", [{ groupId: ug, members: few }]);
+      check("under-full group is ACCEPTED (the designed bot-fill path)",
+        under.status >= 200 && under.status < 300, `got HTTP ${under.status}: ${under.text.slice(0, 200)}`);
+      const uSeats = Array.isArray(under.json?.seats) ? under.json.seats : [];
+      check("under-full group seats exactly the members posted",
+        uSeats.length === few.length && few.every((m) => uSeats.some((s) => s.studentId === m.studentId)),
+        `sent ${few.length}, seated ${uSeats.length}`);
+      const uRep = (Array.isArray(under.json?.groups) ? under.json.groups : []).find((g) => g?.groupId === ug);
+      check("under-full group reports its bot-filled seats (botSeats = seatCount − members)",
+        Boolean(uRep) && uRep.humanSeats === few.length && uRep.botSeats === N - few.length,
+        `got groups=${JSON.stringify(under.json?.groups ?? null).slice(0, 200)}`);
+    }
   }
 
-  // 8. one more member than the guest has seats → SILENT TRUNCATION.
-  //    The contract has no seat-count field at all: the matcher's groupSize and the
-  //    guest's ROLES.length are independent constants. The guest slices to its own
-  //    seat count with no error and no log, so the extra student gets a working deep
-  //    link and only discovers the problem at resumeClassPlayer.
-  const stamp = Date.now();
-  const overId = `conformance-over-${stamp}`;
-  const over = Array.from({ length: opts.seats + 1 }, (_, i) => ({
-    studentId: `${overId}-s${i + 1}`,
-    displayName: `Overflow-${i + 1}`,
-  }));
-  const ov = await callGuest(opts.baseUrl, "provisionClassSession",
-    { instanceId: overId, groups: [{ groupId: `og-${stamp}`, members: over }] }, secret);
-  check("over-full group is ACCEPTED, not rejected (documents the absent seat-count field)",
-    ov.status >= 200 && ov.status < 300, `got HTTP ${ov.status}: ${ov.text.slice(0, 160)}`);
-  const ovSeats = Array.isArray(ov.json?.seats) ? ov.json.seats : [];
-  check(`over-full group is silently truncated to ${opts.seats} seats`,
-    ovSeats.length === opts.seats, `sent ${over.length}, seated ${ovSeats.length}`);
-  const seated = new Set(ovSeats.map((s) => s.studentId));
-  const dropped = over.filter((m) => !seated.has(m.studentId));
-  check("exactly one member was dropped, with no error in the response",
-    dropped.length === 1 && !ov.json?.error && !ov.json?.warning,
-    `dropped=${dropped.length}, body keys=${Object.keys(ov.json ?? {}).join(",")}`);
-  record(BASELINE, "the dropped member is reported nowhere in the response",
-    `student '${dropped[0]?.studentId ?? "?"}' was silently discarded. Hardening should ` +
-    `either reject the group or name the dropped members.`);
+  // 8. D9 — getClassResults refuses a session the classroom did not provision.
+  // ⚠ Honest limit, like finalize's re-fire: this harness can only CREATE classroom
+  // sessions, so it cannot produce the thing D9 refuses. Verified instead against an
+  // emulator with a seeded non-classroom game doc (see the pass-C session report).
+  record(SKIP, "results refuse a non-classroom session (D9)",
+    "not observable over HTTP — this harness can only create classroom sessions.");
 
-  if (ov.json?.gameCode) {
-    // Close the over-full session so it does not sit in_progress for 30 days.
-    await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: ov.json.gameCode }, secret);
-    return { overCode: ov.json.gameCode, overInstance: overId, dropped: dropped[0]?.studentId };
-  }
-  return {};
+  // Close every session the probes created, so none sits in_progress for 30 days.
+  for (const c of probeCodes) await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: c }, secret);
+  return { probeCodes };
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────────────
@@ -808,11 +918,14 @@ async function runSelfTest(opts) {
     results.length = 0; // each scenario is judged on its own run
     const detected = await detectContractVersion(baseUrl);
     const seatEnforced = await detectSeatTokenEnforced(baseUrl);
-    const expect = { ...(EXPECTATIONS[detected] ?? EXPECTATIONS[0]), seatTokenEnforced: seatEnforced };
+    const { seatCount } = await detectSeatCount(baseUrl, SELFTEST_SECRET);
+    const expect = { ...(EXPECTATIONS[detected] ?? EXPECTATIONS[0]), seatTokenEnforced: seatEnforced, seatCount };
     console.log(`   stub speaks contract_version ${detected} → ${expect.label}; ` +
-      `seat tokens ${seatEnforced ? "enforced" : "not enforced"}`);
+      `seat tokens ${seatEnforced ? "enforced" : "not enforced"}; seat count ${seatCount ?? "undeclared"}`);
     check("guest enforces signed seat claims", seatEnforced === opts.expectSeatTokens,
       `enforced=${seatEnforced}, expected=${opts.expectSeatTokens}.`);
+    check("guest declares its seat count (D5)", seatCount !== null,
+      "no integer error.expectedSeatCount on a provision without seatCount.");
     check(`guest reports contract_version ${opts.expectVersion}`, detected === opts.expectVersion,
       `detected ${detected}.`);
 
@@ -828,16 +941,34 @@ async function runSelfTest(opts) {
       else if (hit.status === FAIL) verdicts.push([sc.variant, name, "BIT", "went red as required"]);
       else { verdicts.push([sc.variant, name, "BLIND", `returned ${hit.status}; the harness is not reading this`]); broken += 1; }
     }
+    // ⚠ THE OTHER HALF OF THE PROOF. Everything above shows the harness goes red on a defect;
+    // it cannot show the harness stays GREEN on a correct guest. Two harness bugs (a probe
+    // that sent the seatCount it meant to omit, a probe that never reached the check it was
+    // named for) passed the whole defect proof and surfaced only against the real guest. A
+    // scenario with NO defect must now produce ZERO failures, or the instrument is broken.
+    if (sc.expectClean) {
+      const reds = results.filter((r) => r.status === FAIL);
+      for (const r of reds) {
+        verdicts.push([sc.variant, r.name, "FALSE-RED", "a CORRECT guest failed this — the harness is wrong"]);
+        broken += 1;
+      }
+      if (reds.length === 0) {
+        verdicts.push([sc.variant, "(every assertion)", "CLEAN",
+          `${results.filter((r) => r.status === PASS).length} passed, 0 failed against a correct guest`]);
+      }
+    }
   }
 
   console.log(`\n── INSTRUMENT PROOF ──`);
   for (const [variant, name, verdict, why] of verdicts) {
-    const mark = verdict === "BIT" ? "✓" : "✗";
-    console.log(`  ${mark} ${verdict.padEnd(8)} [${variant}] '${name}' — ${why}`);
+    const mark = verdict === "BIT" || verdict === "CLEAN" ? "✓" : "✗";
+    console.log(`  ${mark} ${verdict.padEnd(9)} [${variant}] '${name}' — ${why}`);
   }
-  const total = verdicts.length;
+  const bit = verdicts.filter((v) => v[2] === "BIT").length;
+  const planted = SELFTEST_SCENARIOS.reduce((n, s) => n + s.expectedFailures.length, 0);
   console.log(broken === 0
-    ? `\n  ✅ Instrument proved: ${total}/${total} planted defects detected across ${SELFTEST_SCENARIOS.length} scenarios.`
+    ? `\n  ✅ Instrument proved: ${bit}/${planted} planted defects detected, and a correct guest drew ` +
+      `0 false reds, across ${SELFTEST_SCENARIOS.length} scenarios.`
     : `\n  ❌ Instrument NOT proved: ${broken} problem(s) above. Do not trust a green run.`);
   process.exit(broken === 0 ? 0 : 1);
 }
@@ -861,10 +992,14 @@ async function main() {
   // ⚠ Seat-token enforcement is NOT derivable from contract_version — pass B keeps v1 on
   // purpose. Feature-detect it and fold it into the expectation set.
   const seatTokenEnforced = await detectSeatTokenEnforced(opts.baseUrl);
-  expect = { ...expect, seatTokenEnforced };
+  // D5: the seat count comes FROM THE GUEST, never from this file (--seats is retired).
+  const { seatCount } = await detectSeatCount(opts.baseUrl, secret);
+  expect = { ...expect, seatTokenEnforced, seatCount };
   console.log(`  guest speaks contract_version ${detected} → ${expect.label}`);
   console.log(`  signed seat claims (D2/D3): ${seatTokenEnforced ? "ENFORCED" : "NOT enforced"}` +
     `${seatTokenEnforced ? "" : "  ⚠ the unsigned-sid defect is still open on this guest"}`);
+  console.log(`  seat count (D5): ${seatCount !== null ? `${seatCount}, declared by the guest`
+    : "NOT DECLARED  ⚠ this guest predates pass C — it speaks v1 but not the frozen v1"}`);
   console.log();
 
   // ⚠ Detection selects the expectation set; it does not excuse a regression. After this
@@ -883,6 +1018,15 @@ async function main() {
   check(`guest reports contract_version ${opts.expectVersion}`, detected === opts.expectVersion,
     `detected ${detected}. If you meant to test a pre-D7 guest, pass --expect-version ${detected}.`);
 
+  // ⚠ Deliberately NO opt-out flag, unlike --no-expect-seat-tokens. Pass C is the last pass
+  // before v1 freezes; there is no older v1 worth recording, and the before-state is already
+  // on file (production 2026-09-09: 59 PASS / 4 KNOWN-CURRENT). A guest without a declared
+  // seat count simply does not implement the frozen v1.
+  check("guest declares its seat count (D5)", seatCount !== null,
+    "a provision with no seatCount did not come back 400 SEAT_COUNT_REQUIRED with an integer " +
+    "error.expectedSeatCount. This guest predates pass C: same contract_version, older shape. " +
+    "Both sides must land together.");
+
   const arc = await runArc(opts, secret, expect);
   const neg = opts.negative ? await runNegative(opts, secret, expect) : {};
 
@@ -899,7 +1043,11 @@ async function main() {
   // ⚠ Name the PROJECT, never the collection alone — collection names repeat across games
   // and carry no project in them. Against a stub there is no project at all, and saying
   // "beergame-mygames-live" there would be a lie that could get real data deleted.
-  const isRealGuest = opts.baseUrl.includes("beergame-mygames-live");
+  // ⚠ The EMULATOR's URL also contains "beergame-mygames-live" (…/beergame-mygames-live/
+  // us-central1), and calling that the Firebase project would tell someone to go deleting
+  // production docs that were never written. Real means the deployed cloudfunctions host.
+  const isRealGuest = /^https:\/\/[^/]*cloudfunctions\.net/.test(opts.baseUrl) &&
+    opts.baseUrl.includes("beergame-mygames-live");
   const where = isRealGuest
     ? "the Firebase project beergame-mygames-live"
     : `${opts.baseUrl} (NOT a real Firebase project — nothing was written to beergame-mygames-live)`;
@@ -908,8 +1056,8 @@ async function main() {
     console.log(`  games/${arc.gameCode}                       status=ended`);
     console.log(`    + players/*, teams/*, classroomPlayers/*  (instanceId ${arc.instanceId})`);
   }
-  if (neg.overCode) {
-    console.log(`  games/${neg.overCode}                       status=ended  (over-full probe)`);
+  for (const c of neg.probeCodes ?? []) {
+    console.log(`  games/${c}                       status=ended  (negative-suite probe)`);
   }
   if (isRealGuest) {
     console.log(`  ⚠ NOT self-cleaning. There is no delete endpoint in the contract, and this`);
