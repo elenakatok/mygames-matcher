@@ -231,26 +231,6 @@ export default function GameControlStrip() {
         )}
         {anyStarted && <span style={{ fontSize: typography.sizeXs, color: colors.textMuted }}>Locked — a group has been handed off.</span>}
       </div>
-
-      {/* ⚠ GUIDANCE, NOT A GATE — and deliberately not worded as a requirement. Grouping
-          after students log in works perfectly well; the students' pages simply do not
-          notice, because the online holding screen has no live subscription (the classroom
-          waiting room does). Until that is fixed, grouping first avoids the situation
-          entirely, and telling a student to reload resolves it if it happens.
-          ⚠ This is NOT the fix, and it must not read as though the instructor did something
-          wrong, or as though a student who logged in early is at fault. Nothing here
-          disables any control. */}
-      {online && (
-        <p
-          data-testid="online-grouping-order"
-          style={{ margin: `${spacing.gapSm} 0 0`, fontSize: typography.sizeXs,
-                   color: colors.textSecondary, lineHeight: 1.5 }}
-        >
-          Tip: forming groups before students log in gives them the smoothest arrival.
-          If you group afterwards, their pages will not notice on their own — ask them to
-          reload, and they will go straight to their group.
-        </p>
-      )}
     </div>
 
     <GroupsPanel

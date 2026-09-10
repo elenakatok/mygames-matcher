@@ -3,7 +3,7 @@ import { SEATS_PER_GROUP_WORD } from '../groupSize'
 import { doc, getDoc } from 'firebase/firestore'
 import { auth, db, rtdb } from '../firebase'
 import { assignRole, confirmReady, verifyAttendanceCode, recordLogin, CLASSROOM_URL } from '../api'
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import {
   useStudentSession,
   GameHeader,
@@ -15,6 +15,7 @@ import {
 } from '@mygames/game-ui'
 import type { BootstrapArgs } from '@mygames/game-ui'
 import OnlineGroupReveal from '../game/OnlineGroupReveal'
+import OnlineHolding from '../game/OnlineHolding'
 import HandoffRedirect from './HandoffRedirect'
 
 /**
@@ -181,6 +182,20 @@ export default function Play() {
     return () => { cancelled = true }
   }, [session])
 
+  // Online-only: re-resolve once the live holding screen sees group_id appear. The matcher
+  // has no prep, so it has no rerouteOnline — this is its only online re-route. It calls
+  // routeToPhase(…, 'off') directly and APPLIES THE REVEAL GATE exactly as session start
+  // does: setting the phase alone would drop the student past the reveal straight onto the
+  // hand-off screen. revealDismissed keeps a reveal already continued past from reappearing.
+  const rerouteFromHolding = useCallback(async () => {
+    if (session.kind !== 'ready') return
+    try {
+      const res = await routeToPhase(session.participantId, session.gameInstanceId, 'off')
+      setPhase(res.phase)
+      setRevealGroupId(res.revealGroupId && !revealDismissed.current ? res.revealGroupId : null)
+    } catch { /* leave the holding screen in place; its next snapshot retries */ }
+  }, [session])
+
   // ── Render: pre-session states (no header) ────────────────────────────────
 
   if (session.kind === 'loading' || (session.kind === 'ready' && phase.name === 'loading')) {
@@ -293,23 +308,16 @@ export default function Play() {
         </div>
       )}
 
+      {/* LIVE: subscribes to group_id and re-routes through rerouteFromHolding, which applies
+          the reveal gate. Replaces 764a1a4's "reload this page" stopgap, which described the
+          old static branch honestly and is now false. Not WaitingRoom — see
+          game/OnlineHolding.tsx for why. */}
       {phase.name === 'online_holding' && (
-        <main style={{ padding: layout.pagePad, maxWidth: layout.contentWidth, margin: '0 auto' }}>
-          <h1 style={{ marginTop: 0 }}>Not in a group yet</h1>
-          {/* ⚠ THE OLD COPY PROMISED A LIVE UPDATE THIS BRANCH CANNOT DELIVER. There is no
-              subscription here: routeToPhase reads the participant document ONCE with
-              getDoc, so a student parked on this screen never learns that grouping happened
-              and sits here indefinitely. The classroom branch mounts a live WaitingRoom;
-              this one mounts static text.
-              Telling the student to reload is the honest description of what the code does.
-              ⚠ DELIBERATELY NOT FIXED HERE — no subscription, no poll, no timer. Mounting a
-              subscribing component is its own pass, because WaitingRoom's copy and its
-              latecomer_absent branch are classroom-flavoured and need care before reuse. */}
-          <p data-testid="online-holding" style={{ lineHeight: 1.6, color: colors.textSecondary }}>
-            Once your instructor tells you the groups are ready, reload this page to
-            go to your group.
-          </p>
-        </main>
+        <OnlineHolding
+          participantId={participantId}
+          gameInstanceId={gameInstanceId}
+          onGrouped={rerouteFromHolding}
+        />
       )}
 
       {phase.name === 'hold' && (
