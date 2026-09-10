@@ -110,6 +110,8 @@ export default function Play() {
 
   const [phase, setPhase]             = useState<GamePhase>({ name: 'loading' })
   const [revealGroupId, setRevealGroupId] = useState<string | null>(null)
+  // True only when recordLogin FAILED — never set on a successful classroom session.
+  const [modeUnknown, setModeUnknown] = useState(false)
   const revealDismissed               = useRef(false)
   const [confError,   setConfError]   = useState<string | null>(null)
   const [confLoading, setConfLoading] = useState(false)
@@ -144,12 +146,24 @@ export default function Play() {
       // Session establishment: stamp last_login_at (best-effort) and learn the mode. On any
       // failure we fall back to 'on' (the classroom flow), so a transient recordLogin error
       // never strands a classroom student.
+      // ⚠ ON FAILURE THIS IS NO LONGER SILENT. The fallback to 'on' is unchanged — a
+      // transient error must not strand a genuine classroom student — but a student who
+      // lands on the classroom path BECAUSE this call failed now sees that something went
+      // wrong, and the error is logged. Previously the two were indistinguishable: an
+      // online student got the attendance-code screen with no signal, which is precisely
+      // how the clock_mode defect stayed invisible.
+      // SUCCESS BEHAVIOUR IS UNTOUCHED.
       let m: Mode = 'on'
+      let modeFailed = false
       try {
         const rec = await recordLogin()
         m = rec.clock_mode === 'off' ? 'off' : 'on'
-      } catch { /* best-effort; default to classroom routing */ }
+      } catch (err) {
+        modeFailed = true
+        console.error('[Play] recordLogin failed; falling back to classroom routing', err)
+      }
       if (cancelled) return
+      setModeUnknown(modeFailed)
 
       let res: { phase: GamePhase; revealGroupId: string | null }
       try {
@@ -255,6 +269,29 @@ export default function Play() {
   return (
     <div style={{ fontFamily: typography.fontFamily }}>
       <GameHeader />
+
+      {/* ⚠ Shown ONLY when recordLogin threw. A successful session — classroom or online —
+          never renders this. Without it, a student sent down the classroom path by a failed
+          mode lookup sees a screen indistinguishable from a real in-class session, which is
+          how the clock_mode defect went unnoticed. Reloading re-runs the lookup. */}
+      {modeUnknown && (
+        <div
+          data-testid="mode-unknown"
+          role="status"
+          style={{
+            padding: spacing.gapSm,
+            margin: `${spacing.gapSm} auto 0`,
+            maxWidth: layout.contentWidth,
+            border: `1px solid ${colors.textSecondary}`,
+            borderRadius: 4,
+            lineHeight: 1.5,
+          }}
+        >
+          <strong>We couldn&apos;t confirm your session type.</strong>{' '}
+          You&apos;re being shown the in-class screens. If your instructor said this is an
+          online session, reload this page — and tell them if it keeps happening.
+        </div>
+      )}
 
       {phase.name === 'online_holding' && (
         <main style={{ padding: layout.pagePad, maxWidth: layout.contentWidth, margin: '0 auto' }}>

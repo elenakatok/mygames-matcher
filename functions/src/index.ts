@@ -70,6 +70,11 @@ export {
   getSeatLink,
 } from "./online";
 
+// ── instance bootstrap ─────────────────────────────────────────────────────────
+// Writes clock_mode at instance creation so neither consumer ever defaults an absent
+// field. See seedInstanceConfig.ts for why this is a trigger and not a creation site.
+export { seedInstanceConfig } from "./seedInstanceConfig";
+
 // ── health ─────────────────────────────────────────────────────────────────────
 const CORS_ORIGINS = new Set(ACTIVE_TENANT.corsOrigins);
 export const health = onRequest((req, res) => {

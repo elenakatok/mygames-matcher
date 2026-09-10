@@ -5,6 +5,8 @@
   },
   "hosting": {
     "public": "frontend/dist",
+    "_comment_predeploy": "⚠ WITHOUT THIS, `firebase deploy --only hosting` ships whatever is already in frontend/dist, however stale, and reports success. `firebase deploy` rebuilds FUNCTIONS but never the Vite frontend. On 2026-09-09 the matcher hosting deploy shipped current code only because the frontend had been built by hand minutes earlier. Mirrors the hook games/beergame/firebase.json already has; --prefix points at frontend/ because the matcher's SPA lives there rather than at the repo root.",
+    "predeploy": ["npm --prefix \"$PROJECT_DIR/frontend\" run build"],
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
     "rewrites": [{ "source": "**", "destination": "/index.html" }]
   },
