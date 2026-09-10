@@ -34,6 +34,16 @@ export interface MatchingTenant {
    */
   scoreDirection: ScoreDirection;
 
+  /**
+   * Whether this guest receives students' DISPLAY NAMES at hand-off (provision members carry
+   * `displayName`). Declared per tenant, with the reason written beside the value — the same
+   * shape as scoreDirection, because the right answer differs per guest: a game where
+   * students must find or address each other needs names; one that never shows a player to
+   * another should not receive them. ⚠ Required, with no default: only the tenant can say.
+   * (Pass C's D4 withheld names from every guest; reversed 2026-09-10.)
+   */
+  receivesDisplayNames: boolean;
+
   /** The guest game's seat roles — METADATA only (the guest game assigns them). */
   seatRoles?: string[];
 
@@ -87,6 +97,13 @@ export const BEERGAME_TENANT: MatchingTenant = {
   groupSize: 4,
   // The Beer Game's team outcome is TOTAL SUPPLY-CHAIN COST: the cheaper team played better.
   scoreDirection: "lower_is_better",
+  // YES. Names were put on the Beer Game's screens deliberately, because ids were worse:
+  // teammates see each other's names on the role cards, the player screen greets the student
+  // by name, and the instructor's lobby, report and CSV list players by name. Without names
+  // every one of those shows a 20-character participant id. Pass C's D4 withheld them on the
+  // grounds that the guest "fell back to studentId" — but a graceful fallback is what happens
+  // when a name is MISSING; it is not evidence that nobody wanted the name.
+  receivesDisplayNames: true,
   seatRoles: ["retailer", "wholesaler", "distributor", "factory"],
   modes: { inClass: true, online: true },
   corsOrigins: [

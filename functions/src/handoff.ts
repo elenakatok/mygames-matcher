@@ -183,6 +183,32 @@ function parseGuestResults(gameCode: string, out: unknown): GuestResults {
   };
 }
 
+/**
+ * The provision body's members[]. Pure, so both declarations can be checked without Firestore.
+ *   receivesDisplayNames false → [{ studentId }]
+ *   receivesDisplayNames true  → [{ studentId, displayName }], the name resolved EXACTLY as it
+ *   was before pass C:
+ *   ⚠ `display_name` is only set once a participant has been through online grouping;
+ *   syncRoster (and in-class matching) writes the roster `name`, not `display_name`. Reading
+ *   display_name ALONE fell back to the raw pid, so students showed up in the Beer Game as
+ *   "dNkRCOmr1BlvOzTuxxuR". Fall back name-first, exactly like the shared displayNameOf.
+ */
+export function provisionMembers(
+  memberIds: string[],
+  participantById: Map<string, Record<string, unknown>>,
+  receivesDisplayNames: boolean,
+): Array<{ studentId: string; displayName?: string }> {
+  if (!receivesDisplayNames) return memberIds.map((studentId) => ({ studentId }));
+  return memberIds.map((pid) => {
+    const p = participantById.get(pid) ?? {};
+    const displayName =
+      (typeof p["display_name"] === "string" && p["display_name"].trim()) ? (p["display_name"] as string) :
+      (typeof p["name"] === "string" && (p["name"] as string).trim()) ? (p["name"] as string) :
+      pid;
+    return { studentId: pid, displayName };
+  });
+}
+
 export async function provisionGroupToTenant(iid: string, groupId: string): Promise<void> {
   const t = ACTIVE_TENANT;
   const groupRef = db().collection("game_instances").doc(iid).collection("groups").doc(groupId);
@@ -195,15 +221,19 @@ export async function provisionGroupToTenant(iid: string, groupId: string): Prom
   const bots = new Set(Array.isArray(g["bot_participants"]) ? (g["bot_participants"] as string[]) : []);
 
   // Matcher-bots are NOT posted: the guest bot-fills the seats they held, and says so (D5).
-  // ⚠ D4 — "displayName is removed from the provision body. It is the only PII on the wire.
-  // It flows one way and once, nothing reads it back across the boundary, and the guest
-  // already falls back to studentId when it is absent." A member is { studentId } and
-  // nothing else, so no student name enters a project outside Elena's control; the real
-  // names stay on the matcher dashboard, on our side of the boundary. (This also drops a
-  // Firestore read per member that existed only to look the names up.)
   const memberIds = seatIds.filter((pid) => !bots.has(pid));
   if (memberIds.length === 0) return;
-  const members = memberIds.map((studentId) => ({ studentId }));
+
+  // DISPLAY NAMES are sent only when the tenant DECLARES it receives them (tenants.ts
+  // receivesDisplayNames, reason recorded beside the value). Pass C's D4 withheld names from
+  // every guest; that is reversed. For a tenant that declines, members are { studentId } and
+  // no participant doc is read at all.
+  const participantById = new Map<string, Record<string, unknown>>();
+  if (t.receivesDisplayNames) {
+    const partCol = db().collection("game_instances").doc(iid).collection("participants");
+    for (const pid of memberIds) participantById.set(pid, (await partCol.doc(pid).get()).data() ?? {});
+  }
+  const members = provisionMembers(memberIds, participantById, t.receivesDisplayNames);
 
   // ⚠ EMULATOR ONLY: let the e2e harness point the hand-off at a mock provisioning
   // endpoint. Gated on FUNCTIONS_EMULATOR so a deployed matcher can NEVER be redirected

@@ -15,7 +15,8 @@
 // implements the FROZEN v1 (pass C included), so each defect shows up in its own assertions
 // instead of spraying unrelated reds.
 //
-//   conformant  NO defect — the harness must produce zero failures against it
+//   conformant           NO defect, names declared — must draw zero failures
+//   conformant-declined  NO defect, names declined — must draw zero failures
 //   classic     v1-correct EXCEPT the three §5.2 defects:
 //                 1. any Bearer accepted        → "wrong secret → 401" must go red
 //                 2. issues `BEER001`           → the game-code regex must go red
@@ -32,7 +33,10 @@
 //   skips-missing-id       skips a member with no studentId, silently (2026-09-09)
 //   silent-botfill         bot-fills an under-full group without saying so (found on
 //                          production 2026-09-09, missed by the extract)
-//   echoes-name            stores the displayName it was sent and hands it back (D4's PII)
+//   ── display names (per tenant) ──
+//   drops-declared-name    names declared, but the claim does not return the name it was
+//                          sent — pass C's guest, which D4's reversal undoes
+//   names-despite-decline  names declined, yet the claim hands back a name anyway
 //
 // That lying-v1 case is the whole point of version-keying the expectations: under a
 // hardcoded baseline a 500 was "known-current" forever and nobody had to notice. Under v1
@@ -174,8 +178,10 @@ function makeServer(variant) {
             : p.people;
           placed.forEach((m, i) => seats.push({
             studentId: m.sid, role: ROLES[i], teamId, playerId: `p${gi + 1}-${i + 1}`, groupId: p.groupId,
-            // DEFECT (echoes-name): keeps the stray displayName, as the pre-pass-C guest did.
-            _name: variant === "echoes-name" ? (m.displayName ?? null) : null,
+            // Correct: keep the display name when one was SUPPLIED (a names-declared tenant).
+            // DEFECT (drops-declared-name): throws it away — pass C's guest.
+            _name: variant !== "drops-declared-name" && typeof m.displayName === "string" && m.displayName.trim()
+              ? m.displayName : null,
           }));
           reports.push({
             groupId: p.groupId, teamId, humanSeats: placed.length,
@@ -259,8 +265,11 @@ function makeServer(variant) {
         if (!seat) return sendErr(404, "SEAT_NOT_FOUND", "No seat for this student.");
         return send(200, body({
           playerId: seat.playerId, role: seat.role, teamId: seat.teamId, teamName: "Selftest Team",
-          // D4: the frozen v1 returns NO name. Only the echoes-name defect hands one back.
-          ...(variant === "echoes-name" ? { name: seat._name } : {}),
+          // Correct: `name` only when a display name was supplied at provision.
+          // DEFECT (names-despite-decline): hands back its studentId fallback as a name even
+          // though none was supplied — a tenant that declined names is still handed one.
+          ...(seat._name ? { name: seat._name }
+            : variant === "names-despite-decline" ? { name: studentId } : {}),
           sessionToken: crypto.randomBytes(12).toString("hex"),
         }));
       }
@@ -294,7 +303,15 @@ export const SELFTEST_SCENARIOS = [
     // here — this is the half of the proof the defect scenarios cannot give: that a green
     // run means something because the harness does not cry wolf at a correct guest.
     variant: "conformant",
-    what: "no defect — the frozen v1 done right; the harness must stay entirely green",
+    what: "no defect, names DECLARED — the harness must stay entirely green",
+    displayNames: "declared",
+    expectedFailures: [],
+    expectClean: true,
+  },
+  {
+    variant: "conformant-declined",
+    what: "no defect, names DECLINED — the harness must stay entirely green",
+    displayNames: "declined",
     expectedFailures: [],
     expectClean: true,
   },
@@ -380,11 +397,21 @@ export const SELFTEST_SCENARIOS = [
       "under-full group reports its bot-filled seats (botSeats = seatCount − members)",
     ],
   },
+  // ── display names, per tenant ────────────────────────────────────────────────────
   {
-    variant: "echoes-name",
-    what: "D4: a guest that keeps the displayName it was sent and hands it back",
+    variant: "drops-declared-name",
+    what: "names DECLARED, but the claim does not return the name it was sent (pass C's guest)",
+    displayNames: "declared",
     expectedFailures: [
-      "the seat claim carries no student name (D4 — no name field, planted canary absent)",
+      "seat claim returns the display name the matcher sent (names declared)",
+    ],
+  },
+  {
+    variant: "names-despite-decline",
+    what: "names DECLINED, yet the claim hands back a name anyway",
+    displayNames: "declined",
+    expectedFailures: [
+      "seat claim carries no name (names declined)",
     ],
   },
 ];

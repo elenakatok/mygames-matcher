@@ -316,11 +316,14 @@ async function classroomFlow() {
   check(!!handoff, `7. mock Beer Game received a hand-off`)
   const members = handoff?.groups?.[0]?.members ?? []
   check(members.length === 4, `8. hand-off carried 4 human members — got ${members.length}`)
-  // ⚠ D4 — no student NAME crosses the boundary. These lines used to assert the OPPOSITE
-  // (that members carried the roster displayName) — i.e. they certified the PII crossing.
-  check(members.every((x) => x.studentId && Object.keys(x).length === 1), `9. members carry studentId ONLY — no displayName (D4)`)
-  const leaked = ROSTER.map((r) => r.name).filter((n) => JSON.stringify(handoff ?? {}).includes(n))
-  check(leaked.length === 0, `9a. no roster name appears anywhere in the hand-off body (D4) — ${leaked.join(', ') || 'none'}`)
+  // Names cross because the Beer Game tenant DECLARES it receives them (tenants.ts
+  // receivesDisplayNames: true). Pass C's D4 inverted these two lines; that is reversed, and
+  // they are restored as they were.
+  check(members.every((x) => x.studentId && x.displayName), `9. members carry studentId + displayName`)
+  // Names must be the ROSTER names, not the raw pid (the "dNkRCO…" bug).
+  const nameById = Object.fromEntries(ROSTER.map((r) => [r.participant_id, r.name]))
+  const namesOk = members.every((x) => x.displayName === nameById[x.studentId] && x.displayName !== x.studentId)
+  check(namesOk, `9a. member displayNames are real names, not pids — ${members.map((x) => x.displayName).join(', ')}`)
   check(handoff?.seatCount === 4, `9c. hand-off declares seatCount 4 explicitly (D5) — got ${JSON.stringify(handoff?.seatCount)}`)
   // Demand config translated correctly: 10 weeks, 5 for weeks 0-2, 12 from week 3.
   const cfgOut = handoff?.config ?? {}

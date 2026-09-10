@@ -31,13 +31,25 @@
 //       is the whole credential (D2/D3). The student never carries the shared secret.
 //
 // ── PASS C: THE FROZEN v1 ─────────────────────────────────────────────────────────────
-// Pass C (D4 no displayName, D5 explicit seat count, D6 verifiable seats, D9 results guard)
-// changed payload shape WITHOUT bumping contract_version: nothing outside this project has
+// Pass C (D5 explicit seat count, D6 verifiable seats, D9 results guard — its D4 "no names"
+// is reversed, see DISPLAY NAMES below) changed payload shape WITHOUT bumping
+// contract_version: nothing outside this project has
 // ever spoken the contract, so a bump would invent version history for revisions nobody
 // used. v1 freezes when the contract document ships. So the version CANNOT select pass C's
 // expectations — and this file does not try. v1's expectations ARE the frozen v1; a guest
 // that predates pass C fails them, and detectSeatCount() makes that failure name itself in
 // one line instead of a dozen unexplained reds.
+//
+// ── DISPLAY NAMES: DECLARED PER TENANT ────────────────────────────────────────────────
+// Whether a guest receives students' display names is its TENANT's declaration (matcher
+// tenants.ts receivesDisplayNames), not a contract version and not a default. Neither the
+// version nor the guest can tell the harness which to expect, so the harness is TOLD:
+//   --display-names declared   members carry displayName; the seat claim must return it
+//   --display-names declined   no names are sent;          the seat claim must carry none
+// Without the flag it reads the declaration from the matcher's own compiled tenant
+// (functions/lib/tenants.js) — and only when the base URL IS that tenant's guest. Anywhere
+// else a missing flag is fatal: guessing would pass a guest that leaks names, or fail one
+// that correctly withholds them.
 //
 // ── SECRETS ───────────────────────────────────────────────────────────────────────────
 // The harness acts as the MATCHER, so it needs the matcher's copy of the provision secret:
@@ -58,6 +70,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { createHash, createHmac } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MATCHER_ROOT = join(HERE, "..");
@@ -111,7 +124,7 @@ const EXPECTATIONS = {
   // v1 — what D7/D8 make true. Nothing here is a baseline; a v1 guest that misses any of
   // it is failing its own declared contract.
   1: {
-    label: "v1 (frozen: D7/D8, D2/D3 seat tokens, pass C D4/D5/D6/D9)",
+    label: "v1 (D7/D8, D2/D3 seat tokens, pass C D5/D6/D9, display names per tenant)",
     versionEchoed: true,
     versionEnforced: true,
     errorShape: "object",          // { contract_version, error: { code, message } }
@@ -144,7 +157,8 @@ const DEFAULTS = {
 
 function parseArgs(argv) {
   const out = { ...DEFAULTS, negative: false, selfTest: false, secretEnv: SECRET_NAME,
-    expectVersion: CONTRACT_VERSION, expectSeatTokens: true, apiKey: null, apiKeyFile: null, json: false };
+    expectVersion: CONTRACT_VERSION, expectSeatTokens: true, apiKey: null, apiKeyFile: null, json: false,
+    displayNames: null };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     const next = () => argv[(i += 1)];
@@ -153,6 +167,14 @@ function parseArgs(argv) {
     else if (a === "--secret-env") out.secretEnv = next();
     else if (a === "--expect-version") out.expectVersion = Number(next());
     else if (a === "--no-expect-seat-tokens") out.expectSeatTokens = false;
+    else if (a === "--display-names") {
+      const v = next();
+      if (v !== "declared" && v !== "declined") {
+        console.error(`--display-names takes 'declared' or 'declined', got '${v}'.`);
+        process.exit(2);
+      }
+      out.displayNames = v;
+    }
     else if (a === "--json") out.json = true;
     else if (a === "--base-url") out.baseUrl = next().replace(/\/$/, "");
     else if (a === "--play-url") out.playUrl = next().replace(/\/$/, "");
@@ -186,6 +208,10 @@ guest-conformance.mjs — conformance harness against the REAL guest endpoints
   --no-expect-seat-tokens
                         allow a guest that does NOT enforce signed seat claims (D2/D3).
                         Use only to record a pre-pass-B guest; by default that FAILS.
+  --display-names declared|declined
+                        the guest's tenant declaration (matcher tenants.ts
+                        receivesDisplayNames). Read from the matcher's compiled tenant when
+                        testing that tenant's own guest; REQUIRED against any other guest.
   --base-url <url>      guest functions origin   (default ${DEFAULTS.baseUrl})
   --play-url <url>      guest play origin        (default ${DEFAULTS.playUrl})
   --api-key <key>       Firebase Web API key for the guest project (public, in-bundle
@@ -266,6 +292,34 @@ function resolveSecret(envName = SECRET_NAME) {
 }
 
 const fingerprint = (s) => createHash("sha256").update(s).digest("hex").slice(0, 8);
+
+/**
+ * Which display-name expectation applies — the TENANT's declaration, never a guess. See the
+ * DISPLAY NAMES note in the header: the flag wins; otherwise the matcher's own compiled tenant,
+ * but only for that tenant's own guest; otherwise fatal.
+ */
+function resolveDisplayNames(opts) {
+  if (opts.displayNames) return { mode: opts.displayNames, source: "--display-names" };
+  const lib = join(MATCHER_ROOT, "functions", "lib", "tenants.js");
+  if (existsSync(lib)) {
+    try {
+      const t = createRequire(import.meta.url)(lib).ACTIVE_TENANT;
+      const origin = t?.handoff?.provisionUrl ? new URL(t.handoff.provisionUrl).origin : null;
+      if (typeof t?.receivesDisplayNames === "boolean" && origin === opts.baseUrl) {
+        return { mode: t.receivesDisplayNames ? "declared" : "declined",
+          source: `matcher tenant '${t.gameId}' (functions/lib/tenants.js)` };
+      }
+    } catch { /* fall through to the fatal below */ }
+  }
+  console.error(`
+[FATAL] Say whether this guest's tenant receives display names:
+    --display-names declared    the matcher sends displayName; the seat claim must return it
+    --display-names declined    no names are sent; the seat claim must carry none
+  The harness reads this from the matcher's compiled tenant only when testing that tenant's
+  own guest (${opts.baseUrl} is not it, or functions/lib is not built). It will not guess.
+`);
+  process.exit(2);
+}
 
 // ── result recording ──────────────────────────────────────────────────────────────────
 //
@@ -454,12 +508,12 @@ async function runArc(opts, secret, expect) {
   const stamp = Date.now();
   const instanceId = `conformance-${stamp}`;
   const groupId = `cgroup-${stamp}`;
-  // ⚠ D4 — "displayName is removed from the provision body. It is the only PII on the wire."
-  // The matcher no longer sends one. This harness DOES, deliberately, as a PLANTED CANARY:
-  // it is exactly what a buggy or older matcher would leak, and the frozen-v1 guest must
-  // neither store it nor hand it back. A distinctive string lets every later assertion scan
-  // a WHOLE payload for it rather than checking one field we already expect to be absent.
+  // DISPLAY NAMES are per tenant (see the header). For a names-declared tenant the members
+  // carry a distinctive canary name, so the seat claim can be held to returning EXACTLY the
+  // name sent, and the results payload scanned whole for it (names flow INTO the guest; the
+  // matcher-facing results never carry them). For a tenant that declined, none is sent.
   const canary = `ZZCanary${stamp}`;
+  const namesDeclared = expect.displayNames === "declared";
   // ⚠ Exactly the guest's DECLARED seat count (D5): a full group, so every seat is human and
   // the bot report must say zero. With no declaration, ONE member — never over-full on any
   // guest — and the D5 guard in main() has already failed by name.
@@ -467,11 +521,11 @@ async function runArc(opts, secret, expect) {
   const n = seatCount ?? 1;
   const members = Array.from({ length: n }, (_, i) => ({
     studentId: `${instanceId}-s${i + 1}`,
-    displayName: `${canary}-${i + 1}`,
+    ...(namesDeclared ? { displayName: `${canary}-${i + 1}` } : {}),
   }));
 
   console.log(`\n── ARC ── instance ${instanceId}, ${members.length} members, ` +
-    `seatCount ${seatCount ?? "(undeclared)"}\n`);
+    `seatCount ${seatCount ?? "(undeclared)"}, display names ${expect.displayNames}\n`);
 
   // 1. provision ──────────────────────────────────────────────────────────────────────
   const prov = await callGuest(opts.baseUrl, "provisionClassSession",
@@ -526,8 +580,8 @@ async function runArc(opts, secret, expect) {
   check("provision reports each group's human and bot seats",
     Boolean(report) && report.humanSeats === members.length && report.botSeats === 0,
     `got groups=${JSON.stringify(prov.json?.groups ?? null).slice(0, 200)}`);
-  check("the planted displayName canary is absent from the provision reply (D4)",
-    !prov.text.includes(canary), `canary '${canary}' echoed by provisionClassSession`);
+  check("the provision reply does not echo student names",
+    !prov.text.includes(canary), `name canary '${canary}' echoed by provisionClassSession`);
 
   // 2. deep link ──────────────────────────────────────────────────────────────────────
   const target = seats[0];
@@ -566,19 +620,23 @@ async function runArc(opts, secret, expect) {
     check("seat claim echoes contract_version", claimed?.contract_version === CONTRACT_VERSION,
       `got ${JSON.stringify(claimed?.contract_version)}`);
   }
-  // ⚠ INVERTED BY PASS C. This line used to read "the display name we sent is returned by
-  // the seat claim (documents the PII crossing)" — and it PASSED BECAUSE THE DEFECT EXISTED.
-  // D4 takes the name off the wire, so the same observation must now come back ABSENT.
-  // Pass C stays at contract_version 1, so the version cannot select between the two; the
-  // old assertion is REPLACED outright rather than branched. There is no mode that expects
-  // the name back, because the frozen v1 never returns one.
-  // Conditioned on the claim SUCCEEDING — an error body has no name either, and must not
-  // pass this vacuously.
-  check("the seat claim carries no student name (D4 — no name field, planted canary absent)",
-    claim.status >= 200 && claim.status < 300 && claimed !== null &&
-      !("name" in claimed) && !claim.text.includes(canary),
-    `HTTP ${claim.status}; name=${JSON.stringify(claimed?.name)}; ` +
-    `canary ${claim.text.includes(canary) ? "PRESENT" : "absent"}`);
+  // ⚠ DISPLAY NAMES, PER TENANT. This assertion has now changed twice: before pass C it said
+  // the name came back ("documents the PII crossing"); pass C's D4 inverted it to "absent";
+  // D4 is reversed, and the expectation is now the TENANT's declaration. contract_version
+  // stays 1 and cannot express a per-tenant choice, so the harness is TOLD which applies
+  // (--display-names, or the matcher's own compiled tenant) — it never infers it.
+  // Conditioned on the claim SUCCEEDING, so an error body cannot pass either branch vacuously.
+  const claimOk = claim.status >= 200 && claim.status < 300 && claimed !== null;
+  if (namesDeclared) {
+    const sentName = members.find((m) => m.studentId === target.studentId)?.displayName;
+    check("seat claim returns the display name the matcher sent (names declared)",
+      claimOk && claimed.name === sentName,
+      `HTTP ${claim.status}; sent '${sentName}', claim name=${JSON.stringify(claimed?.name)}`);
+  } else {
+    check("seat claim carries no name (names declined)",
+      claimOk && !("name" in claimed),
+      `HTTP ${claim.status}; name=${JSON.stringify(claimed?.name)} — a tenant that declined names was handed one`);
+  }
 
   // ── THE HIJACK PROBE, NOW INVERTED ──────────────────────────────────────────────────
   //
@@ -919,9 +977,14 @@ async function runSelfTest(opts) {
     const detected = await detectContractVersion(baseUrl);
     const seatEnforced = await detectSeatTokenEnforced(baseUrl);
     const { seatCount } = await detectSeatCount(baseUrl, SELFTEST_SECRET);
-    const expect = { ...(EXPECTATIONS[detected] ?? EXPECTATIONS[0]), seatTokenEnforced: seatEnforced, seatCount };
+    // Each scenario states its tenant's display-name declaration — the self-test is told,
+    // exactly as a real run is.
+    const displayNames = sc.displayNames ?? "declared";
+    const expect = { ...(EXPECTATIONS[detected] ?? EXPECTATIONS[0]), seatTokenEnforced: seatEnforced,
+      seatCount, displayNames };
     console.log(`   stub speaks contract_version ${detected} → ${expect.label}; ` +
-      `seat tokens ${seatEnforced ? "enforced" : "not enforced"}; seat count ${seatCount ?? "undeclared"}`);
+      `seat tokens ${seatEnforced ? "enforced" : "not enforced"}; seat count ${seatCount ?? "undeclared"}; ` +
+      `display names ${displayNames}`);
     check("guest enforces signed seat claims", seatEnforced === opts.expectSeatTokens,
       `enforced=${seatEnforced}, expected=${opts.expectSeatTokens}.`);
     check("guest declares its seat count (D5)", seatCount !== null,
@@ -977,6 +1040,8 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.selfTest) return runSelfTest(opts);
 
+  // Resolved FIRST, so a run with no declaration fails before touching anything.
+  const names = resolveDisplayNames(opts);
   const { value: secret, source } = resolveSecret(opts.secretEnv);
 
   console.log("guest-conformance — REAL guest endpoints, HTTP only, no beergame imports");
@@ -994,12 +1059,13 @@ async function main() {
   const seatTokenEnforced = await detectSeatTokenEnforced(opts.baseUrl);
   // D5: the seat count comes FROM THE GUEST, never from this file (--seats is retired).
   const { seatCount } = await detectSeatCount(opts.baseUrl, secret);
-  expect = { ...expect, seatTokenEnforced, seatCount };
+  expect = { ...expect, seatTokenEnforced, seatCount, displayNames: names.mode };
   console.log(`  guest speaks contract_version ${detected} → ${expect.label}`);
   console.log(`  signed seat claims (D2/D3): ${seatTokenEnforced ? "ENFORCED" : "NOT enforced"}` +
     `${seatTokenEnforced ? "" : "  ⚠ the unsigned-sid defect is still open on this guest"}`);
   console.log(`  seat count (D5): ${seatCount !== null ? `${seatCount}, declared by the guest`
     : "NOT DECLARED  ⚠ this guest predates pass C — it speaks v1 but not the frozen v1"}`);
+  console.log(`  display names: ${names.mode}  (the tenant's declaration, from ${names.source})`);
   console.log();
 
   // ⚠ Detection selects the expectation set; it does not excuse a regression. After this
