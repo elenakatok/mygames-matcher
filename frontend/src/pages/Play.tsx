@@ -296,9 +296,18 @@ export default function Play() {
       {phase.name === 'online_holding' && (
         <main style={{ padding: layout.pagePad, maxWidth: layout.contentWidth, margin: '0 auto' }}>
           <h1 style={{ marginTop: 0 }}>Not in a group yet</h1>
+          {/* ⚠ THE OLD COPY PROMISED A LIVE UPDATE THIS BRANCH CANNOT DELIVER. There is no
+              subscription here: routeToPhase reads the participant document ONCE with
+              getDoc, so a student parked on this screen never learns that grouping happened
+              and sits here indefinitely. The classroom branch mounts a live WaitingRoom;
+              this one mounts static text.
+              Telling the student to reload is the honest description of what the code does.
+              ⚠ DELIBERATELY NOT FIXED HERE — no subscription, no poll, no timer. Mounting a
+              subscribing component is its own pass, because WaitingRoom's copy and its
+              latecomer_absent branch are classroom-flavoured and need care before reuse. */}
           <p data-testid="online-holding" style={{ lineHeight: 1.6, color: colors.textSecondary }}>
-            You are not in a group yet. This page will update when your instructor
-            forms them.
+            Once your instructor tells you the groups are ready, reload this page to
+            go to your group.
           </p>
         </main>
       )}
