@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 //
 // guest-conformance.mjs — drive the REAL guest-game endpoints and assert the wire
-// contract documented in ThirdParty_Game_Wire_Contract_EXTRACT_2026_09_09.md.
+// contract documented in ThirdParty_Game_Integration_Contract_v1.md (the 09-09 extract,
+// ThirdParty_Game_Wire_Contract_EXTRACT_2026_09_09.md, is the pre-hardening before-picture).
+//
+// ⚠ IT ASSERTS CONSISTENCY WHERE A GUEST DECLARES A SHAPE; IT DOES NOT REQUIRE THE BEER
+// GAME'S. Roles, team names and costByRole are the guest's to declare or omit — where it
+// declares one, the rest of the contract must agree with it. What IS required is what the
+// matcher reads, plus seats' teamId/playerId. (Loosened 2026-09-10: a correct single-role
+// guest used to fail. --self-test's conformant-single-role scenario holds that line.)
 //
 // ⚠ WHY THIS EXISTS. matcher-e2e.mjs tests the matcher against a MOCK Beer Game that it
 // also owns. That mock issues game codes like `BEER001` — containing 0 and 1, which the
@@ -107,6 +114,42 @@ function mintSeatToken(gameCode, studentId, secret, ttl = SEAT_TOKEN_TTL_SECONDS
     .update(`seat.v1|${gameCode}|${studentId}|${exp}`)
     .digest("hex");
   return `${exp}.${mac}`;
+}
+
+/**
+ * The matcher's getClassResults validation — functions/src/handoff.ts parseGuestResults —
+ * DUPLICATED on purpose, like the seat-token mint above: this harness imports no source.
+ * Returns null when the matcher would accept the reply, otherwise the reason it would refuse
+ * the whole grading run. ⚠ If parseGuestResults changes, change this with it.
+ */
+function matcherResultsProblem(o, gameCode) {
+  if (!o || typeof o !== "object") return "the reply is not a JSON object";
+  if (o.ok !== true) return `ok is ${JSON.stringify(o.ok)}, not true`;
+  if (o.gameCode !== gameCode) return `it answers for ${JSON.stringify(o.gameCode)}`;
+  if (!Array.isArray(o.teams)) return "teams is not an array";
+  if (!Array.isArray(o.players)) return "players is not an array";
+  if (o.players.length === 0) return "players is empty for a provisioned session";
+  const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+  const numOrNull = (v) => v === null || isNum(v);
+  const strOrNull = (v) => v === null || typeof v === "string";
+  for (const [i, t] of o.teams.entries()) {
+    const r = t ?? {};
+    if (typeof r.teamId !== "string" || !r.teamId) return `teams[${i}].teamId is missing`;
+    if (typeof r.teamName !== "string") return `teams[${i}].teamName is not a string`;
+    if (!isNum(r.teamCost)) return `teams[${i}].teamCost is not a number`;
+  }
+  for (const [i, p] of o.players.entries()) {
+    const r = p ?? {};
+    if (typeof r.studentId !== "string" || !r.studentId) return `players[${i}].studentId is missing`;
+    if (typeof r.participated !== "boolean") return `players[${i}].participated is not a boolean`;
+    if (!strOrNull(r.role) || !strOrNull(r.teamId) || !strOrNull(r.teamName)) {
+      return `players[${i}] role/teamId/teamName must be string or null`;
+    }
+    if (!numOrNull(r.teamCost) || !numOrNull(r.individualCost)) {
+      return `players[${i}] teamCost/individualCost must be number or null`;
+    }
+  }
+  return null;
 }
 
 const EXPECTATIONS = {
@@ -551,11 +594,16 @@ async function runArc(opts, secret, expect) {
 
   const seats = Array.isArray(prov.json.seats) ? prov.json.seats : [];
   check("seats[] returned, one per member", seats.length === members.length, `got ${seats.length}, sent ${members.length}`);
-  check("every seat carries studentId/role/teamId/playerId/groupId",
-    seats.every((s) => s.studentId && s.role && s.teamId && s.playerId && s.groupId),
+  // ⚠ CONSISTENCY, NOT THE BEER GAME'S SHAPE (2026-09-10). This used to require a `role` on
+  // every seat and the roles within a group to be DISTINCT — the Beer Game's four supply-chain
+  // roles. The matcher's own stage family seats ONE undifferentiated 'player' role everywhere,
+  // so a guest built like infoshare failed here while being correct (--self-test's
+  // conformant-single-role scenario went FALSE-RED on exactly this). Whether a seat has a role
+  // is the guest's to declare; where it declares one, the seat claim must agree (below).
+  // The matcher reads only studentId and groupId; teamId and playerId stay required.
+  check("every seat carries studentId/teamId/playerId/groupId",
+    seats.every((s) => s.studentId && s.teamId && s.playerId && s.groupId),
     JSON.stringify(seats.slice(0, 2)));
-  check("seat roles are distinct", new Set(seats.map((s) => s.role)).size === seats.length,
-    `roles: ${seats.map((s) => s.role).join(", ")}`);
   check("our groupId is echoed back, not replaced", seats.every((s) => s.groupId === groupId),
     `got ${JSON.stringify([...new Set(seats.map((s) => s.groupId))])}`);
 
@@ -611,11 +659,17 @@ async function runArc(opts, secret, expect) {
   check("resumeClassPlayer accepts a validly signed claim", claim.status >= 200 && claim.status < 300,
     `HTTP ${claim.status}: ${claim.text.slice(0, 200)}`);
   claimed = claim.json;
-  check("seat payload carries playerId/role/teamId/teamName/sessionToken",
-    Boolean(claimed?.playerId && claimed?.role && claimed?.teamId && claimed?.teamName && claimed?.sessionToken),
+  check("seat payload carries playerId/sessionToken",
+    Boolean(claimed?.playerId && claimed?.sessionToken),
     JSON.stringify(claimed ?? {}).slice(0, 200));
-  check("role matches the seat provisioning assigned", claimed?.role === target.role,
-    `provision said '${target.role}', claim said '${claimed?.role}'`);
+  // Assert only what PROVISIONING declared for this seat: where it gave a role / teamId /
+  // teamName, the claim must return the same value; where it gave none, nothing is asserted.
+  // (teamId is required on every seat above, so it is always declared and always checked.)
+  for (const key of ["role", "teamId", "teamName"]) {
+    if (target[key] == null) continue;
+    check(`${key} matches the seat provisioning assigned`, claimed?.[key] === target[key],
+      `provision said '${target[key]}', claim said '${claimed?.[key]}'`);
+  }
   if (expect.versionEchoed) {
     check("seat claim echoes contract_version", claimed?.contract_version === CONTRACT_VERSION,
       `got ${JSON.stringify(claimed?.contract_version)}`);
@@ -736,9 +790,21 @@ async function runArc(opts, secret, expect) {
   check("every player row has studentId/role/teamId/teamCost/individualCost/participated",
     players.every((p) => "studentId" in p && "role" in p && "teamId" in p && "teamCost" in p && "individualCost" in p && "participated" in p),
     JSON.stringify(players[0] ?? {}));
-  check("teams[] carry teamId/teamName/teamCost/costByRole",
-    teams.every((t) => t.teamId && typeof t.teamName === "string" && "teamCost" in t && t.costByRole),
+  check("teams[] carry teamId/teamName/teamCost",
+    teams.every((t) => t.teamId && typeof t.teamName === "string" && "teamCost" in t),
     JSON.stringify(teams[0] ?? {}));
+  // costByRole is the Beer Game's per-role breakdown and the matcher never reads it. It used
+  // to be required; now absent passes and present must be an object (2026-09-10).
+  const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  check("teams[].costByRole, when present, is an object",
+    teams.every((t) => !("costByRole" in t) || isPlainObject(t.costByRole)),
+    JSON.stringify(teams.map((t) => t.costByRole)).slice(0, 200));
+  // ⚠ THE MATCHER'S OWN VALIDATION. Until 2026-09-10 the checks above were LOOSER than what
+  // the matcher enforces: a guest that omitted players[].teamName, or sent teamCost as a
+  // string, went green here and then had its class's entire grading run refused (D10).
+  const matcherProblem = matcherResultsProblem(rr.json, gameCode);
+  check("results pass the matcher's grading validation (D10)", matcherProblem === null,
+    matcherProblem ?? "");
 
   // The canary assertion: the student NAME must not cross back out.
   check("results contain NO student name (canary absent from the whole payload)",

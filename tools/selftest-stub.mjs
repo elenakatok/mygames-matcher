@@ -17,6 +17,10 @@
 //
 //   conformant           NO defect, names declared — must draw zero failures
 //   conformant-declined  NO defect, names declined — must draw zero failures
+//   conformant-single-role  NO defect, NOT the Beer Game's shape: one 'player' role on every
+//                        seat (the stage family's shape), no team name on the claim, no
+//                        costByRole — must draw zero failures
+//   conformant-roleless  NO defect, no role on any seat at all, names declined — zero failures
 //   classic     v1-correct EXCEPT the three §5.2 defects:
 //                 1. any Bearer accepted        → "wrong secret → 401" must go red
 //                 2. issues `BEER001`           → the game-code regex must go red
@@ -37,6 +41,11 @@
 //   drops-declared-name    names declared, but the claim does not return the name it was
 //                          sent — pass C's guest, which D4's reversal undoes
 //   names-despite-decline  names declined, yet the claim hands back a name anyway
+//   ── consistency, not the Beer Game's shape (2026-09-10) ──
+//   inconsistent-shape     the claim's role and teamId contradict provisioning, and
+//                          costByRole is present but not an object
+//   fails-matcher-validation  results the matcher's grading refuses: no players[].teamName
+//                          and a string teamCost — which the harness used to pass
 //
 // That lying-v1 case is the whole point of version-keying the expectations: under a
 // hardcoded baseline a 500 was "known-current" forever and nobody had to notice. Under v1
@@ -57,6 +66,11 @@ function makeServer(variant) {
   const emitsVersion = variant !== "no-version";
   // The pre-pass-C shape: no seatCount in, none echoed, no per-group report out.
   const declaresSeats = variant !== "undeclared-seat-count";
+  // Shapes a CORRECT guest may take that are not the Beer Game's. The harness asserts
+  // consistency where a guest declares a shape; it must not require the Beer Game's.
+  const singleRole = variant === "conformant-single-role";
+  const roleless = variant === "conformant-roleless";
+  const beerShaped = !singleRole && !roleless; // four roles, teamName on the claim, costByRole
 
   const body = (obj) => (emitsVersion ? { contract_version: CONTRACT_VERSION, ...obj } : obj);
   const errBody = (code, message, extra = {}) => body({ error: { code, message, ...extra } });
@@ -177,15 +191,21 @@ function makeServer(variant) {
             ? p.people.slice(0, ROLES.length - 1)
             : p.people;
           placed.forEach((m, i) => seats.push({
-            studentId: m.sid, role: ROLES[i], teamId, playerId: `p${gi + 1}-${i + 1}`, groupId: p.groupId,
+            studentId: m.sid,
+            // The Beer Game's four distinct roles; or ONE undifferentiated role for every seat
+            // (single-role); or no role at all (roleless).
+            ...(roleless ? {} : { role: singleRole ? "player" : ROLES[i] }),
+            teamId, playerId: `p${gi + 1}-${i + 1}`, groupId: p.groupId,
             // Correct: keep the display name when one was SUPPLIED (a names-declared tenant).
             // DEFECT (drops-declared-name): throws it away — pass C's guest.
             _name: variant !== "drops-declared-name" && typeof m.displayName === "string" && m.displayName.trim()
               ? m.displayName : null,
           }));
           reports.push({
-            groupId: p.groupId, teamId, humanSeats: placed.length,
-            botSeats: ROLES.length - placed.length, botRoles: ROLES.slice(placed.length),
+            groupId: p.groupId, humanSeats: placed.length, botSeats: ROLES.length - placed.length,
+            // teamId/botRoles are informational — the matcher reads neither — so the non-Beer
+            // shapes omit them, to prove a guest may.
+            ...(beerShaped ? { teamId, botRoles: ROLES.slice(placed.length) } : {}),
           });
         });
         sessions.set(code, { seats, ended: false });
@@ -223,13 +243,26 @@ function makeServer(variant) {
           s.ended = true;
           return send(200, body({ ok: true }));
         }
+        // A no-teams guest has nothing to call its team, so "" — a string is all the matcher
+        // requires. costByRole is the Beer Game's; the non-Beer shapes omit it.
+        // DEFECT (inconsistent-shape): costByRole present, but not an object.
         const teams = [{
-          teamId: "team1", teamName: "Selftest Team", teamCost: 1234,
-          costByRole: { retailer: 300, wholesaler: 300, distributor: 300, factory: 334 },
+          teamId: "team1", teamName: beerShaped ? "Selftest Team" : "", teamCost: 1234,
+          ...(beerShaped ? {
+            costByRole: variant === "inconsistent-shape" ? "n/a"
+              : { retailer: 300, wholesaler: 300, distributor: 300, factory: 334 },
+          } : {}),
         }];
+        // DEFECT (fails-matcher-validation): a reply the matcher's grading refuses (handoff.ts
+        // parseGuestResults) — no player row carries teamName (the matcher requires the key,
+        // string or null) and the team's teamCost is a string. Before 2026-09-10 the harness
+        // passed this, and the class's whole grading run would have been refused.
+        const badForMatcher = variant === "fails-matcher-validation";
+        if (badForMatcher) teams[0].teamCost = "1234";
         const players = s.seats.map((seat) => ({
-          studentId: seat.studentId, role: seat.role, teamId: seat.teamId,
-          teamName: "Selftest Team", teamCost: 1234, individualCost: 300, participated: true,
+          studentId: seat.studentId, role: seat.role ?? null, teamId: seat.teamId,
+          ...(badForMatcher ? {} : { teamName: beerShaped ? "Selftest Team" : null }),
+          teamCost: 1234, individualCost: 300, participated: true,
         }));
         return send(200, body({ ok: true, gameCode: code, teams, players }));
       }
@@ -263,8 +296,15 @@ function makeServer(variant) {
         const s2 = sessions.get(code);
         const seat = s2?.seats.find((x) => x.studentId === studentId);
         if (!seat) return sendErr(404, "SEAT_NOT_FOUND", "No seat for this student.");
+        // The claim echoes what provisioning declared: role only when the seat had one, teamId
+        // always; teamName only in the Beer Game's shape (provisioning never declares one).
+        // DEFECT (inconsistent-shape): the claim's role and teamId contradict provisioning's.
+        const drift = variant === "inconsistent-shape";
         return send(200, body({
-          playerId: seat.playerId, role: seat.role, teamId: seat.teamId, teamName: "Selftest Team",
+          playerId: seat.playerId,
+          ...(seat.role != null ? { role: drift ? `${seat.role}-other` : seat.role } : {}),
+          teamId: drift ? `${seat.teamId}-other` : seat.teamId,
+          ...(beerShaped ? { teamName: "Selftest Team" } : {}),
           // Correct: `name` only when a display name was supplied at provision.
           // DEFECT (names-despite-decline): hands back its studentId fallback as a name even
           // though none was supplied — a tenant that declined names is still handed one.
@@ -311,6 +351,27 @@ export const SELFTEST_SCENARIOS = [
   {
     variant: "conformant-declined",
     what: "no defect, names DECLINED — the harness must stay entirely green",
+    displayNames: "declined",
+    expectedFailures: [],
+    expectClean: true,
+  },
+  {
+    // NO DEFECT, and NOT the Beer Game's shape: the stage family's ONE undifferentiated
+    // 'player' role on every seat (infoshare's shape, and the shape of in-class games), no
+    // team name on the claim, no costByRole, no teamId/botRoles in the group report. Until
+    // 2026-09-10 the harness went red on this correct guest ("seat roles are distinct", plus
+    // the Beer Game's claim and teams fields). It must now draw ZERO failures.
+    variant: "conformant-single-role",
+    what: "no defect, ONE role on every seat, no teams — the harness must stay entirely green",
+    displayNames: "declared",
+    expectedFailures: [],
+    expectClean: true,
+  },
+  {
+    // NO DEFECT: provisioning declares no role at all, so the harness asserts nothing about
+    // the claim's role — the "if it returned none, assert nothing" half of the rule.
+    variant: "conformant-roleless",
+    what: "no defect, NO role on any seat, no teams, names DECLINED — must stay entirely green",
     displayNames: "declined",
     expectedFailures: [],
     expectClean: true,
@@ -412,6 +473,23 @@ export const SELFTEST_SCENARIOS = [
     displayNames: "declined",
     expectedFailures: [
       "seat claim carries no name (names declined)",
+    ],
+  },
+  // ── consistency, not the Beer Game's shape (2026-09-10) ──────────────────────────
+  {
+    variant: "inconsistent-shape",
+    what: "the claim contradicts provisioning (role, teamId); costByRole is not an object",
+    expectedFailures: [
+      "role matches the seat provisioning assigned",
+      "teamId matches the seat provisioning assigned",
+      "teams[].costByRole, when present, is an object",
+    ],
+  },
+  {
+    variant: "fails-matcher-validation",
+    what: "results the matcher's grading refuses (no players[].teamName, a string teamCost)",
+    expectedFailures: [
+      "results pass the matcher's grading validation (D10)",
     ],
   },
 ];
