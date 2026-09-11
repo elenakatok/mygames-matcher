@@ -237,7 +237,18 @@ interface GradeRow {
   details: Record<string, unknown>;
 }
 
+/**
+ * Push one gradebook row — and REQUIRE the classroom to confirm it stored that row.
+ *
+ * ⚠ A 2xx IS NOT A STORED GRADE. Until 2026-09-10 this returned on any 2xx without reading
+ * the body, and CLASSROOM_CALLBACK_URL pointed at the classroom's Hosting site, whose only
+ * rewrite was ** → /index.html: every push got "200 text/html", counted as pushed, and the
+ * dashboard said "✓ Recorded" over an empty gradebook. receiveGameResult answers a stored row
+ * with { success: true, result_id: "<game_instance_id>_<participant_id>" } — only that exact
+ * echo counts. Anything else throws, lands in push.failed, and the button says "retry".
+ */
 async function pushGrade(row: GradeRow, url: string, secret: string): Promise<void> {
+  const expectedId = `${row.game_instance_id}_${row.participant_id}`;
   const retryDelays = [300, 800];
   for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, retryDelays[attempt - 1]));
@@ -246,7 +257,15 @@ async function pushGrade(row: GradeRow, url: string, secret: string): Promise<vo
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
       body: JSON.stringify(row),
     });
-    if (res.status >= 200 && res.status < 300) return;
+    if (res.status >= 200 && res.status < 300) {
+      const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      if (body?.["success"] === true && body["result_id"] === expectedId) return;
+      // Not retried: the same receiver will give the same non-answer.
+      throw new Error(
+        `HTTP ${res.status} (${res.headers.get("content-type") ?? "no content-type"}) with no confirmation the grade ` +
+        `was stored — expected {success:true, result_id:"${expectedId}"}. Is CLASSROOM_CALLBACK_URL receiveGameResult?`,
+      );
+    }
     if (res.status < 500) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 160)}`);
   }
   throw new Error("HTTP 5xx after retries");

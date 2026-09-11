@@ -148,8 +148,15 @@ function startClassroom() {
       req.on('end', () => {
         let parsed = null
         try { parsed = JSON.parse(b) } catch { /* */ }
-        r.writeHead(200, { 'Content-Type': 'application/json' })
         const url = req.url || '/'
+        // ⚠ THE 2026-09-10 PRODUCTION DEFECT, AS A MOCK: the grade push lands on a web page that
+        // answers every POST with 200 text/html (the classroom Hosting catch-all ** → index.html).
+        if (url.endsWith('/game-results') && mockMode === 'html-callback') {
+          gradePushes.push(parsed)
+          r.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          r.end('<!doctype html><html><head><title>myGames Classroom</title></head><body></body></html>'); return
+        }
+        r.writeHead(200, { 'Content-Type': 'application/json' })
         // The mock BEER GAME hand-off (/provision): a hand-off carries `groups` — answer with
         // a game code and remember which humans went into it (so /results can echo their costs).
         // ⚠ The mock speaks the FROZEN v1 now (pass C): a contract-shaped gameCode (the old
@@ -191,7 +198,10 @@ function startClassroom() {
         // /game-results — the MATCHER's gradebook push (one row per human student).
         if (url.endsWith('/game-results')) {
           gradePushes.push(parsed)
-          r.end(JSON.stringify({ contract_version: 1, ok: true })); return
+          // 'unconfirmed-json' is this mock's OLD answer — a JSON 2xx that confirms nothing.
+          if (mockMode === 'unconfirmed-json') { r.end(JSON.stringify({ contract_version: 1, ok: true })); return }
+          // Otherwise answer EXACTLY as the real receiveGameResult does for a stored row.
+          r.end(JSON.stringify({ success: true, result_id: `${parsed?.game_instance_id}_${parsed?.participant_id}` })); return
         }
         // Otherwise it is a roster pull.
         rosterRequests++
@@ -521,6 +531,25 @@ async function contractFlow() {
   mockMode = 'ok'
   const sr2 = await scoreAndRecord(gid)
   check(sr2.ok && sr2.result.scored === 4, `8. honest results, same button: graded — scored ${sr2.result?.scored ?? sr2.error}`)
+
+  // ⚠ A 2xx IS NOT A STORED GRADE (2026-09-10). In production every push got "200 text/html"
+  // from the classroom's Hosting catch-all, pushGrade counted each as stored, and the button
+  // said "✓ Recorded" over an empty gradebook. Now only receiveGameResult's result_id echo counts.
+  mockMode = 'html-callback'
+  const srHtml = await scoreAndRecord(gid)
+  const htmlPush = srHtml.result?.push
+  check(srHtml.ok && htmlPush?.succeeded === 0 && htmlPush?.failed?.length === 4,
+    `9. a 200 text/html answer is NOT a stored grade — succeeded ${htmlPush?.succeeded}, failed ${htmlPush?.failed?.length ?? srHtml.error}`)
+  check(/no confirmation/.test(htmlPush?.failed?.[0]?.reason ?? '') && /text\/html/.test(htmlPush?.failed?.[0]?.reason ?? ''),
+    `10. …and each failure says why — "${(htmlPush?.failed?.[0]?.reason ?? '').slice(0, 100)}"`)
+  mockMode = 'unconfirmed-json'
+  const srJson = await scoreAndRecord(gid)
+  check(srJson.ok && srJson.result?.push?.succeeded === 0 && srJson.result?.push?.failed?.length === 4,
+    `11. a JSON 2xx that does not echo the result_id is not a stored grade either — failed ${srJson.result?.push?.failed?.length ?? srJson.error}`)
+  mockMode = 'ok'
+  const srOk = await scoreAndRecord(gid)
+  check(srOk.ok && srOk.result?.push?.succeeded === 4 && srOk.result?.push?.failed?.length === 0,
+    `12. a receiver that confirms each row: all 4 stored — succeeded ${srOk.result?.push?.succeeded}`)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
