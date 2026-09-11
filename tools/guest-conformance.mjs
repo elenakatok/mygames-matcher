@@ -1,8 +1,19 @@
 #!/usr/bin/env node
 //
-// guest-conformance.mjs — drive the REAL guest-game endpoints and assert the wire
-// contract documented in ThirdParty_Game_Integration_Contract_v1.md (the 09-09 extract,
-// ThirdParty_Game_Wire_Contract_EXTRACT_2026_09_09.md, is the pre-hardening before-picture).
+// guest-conformance.mjs — the conformance harness for a mygames.live GUEST GAME.
+//
+// If you received this file to test your own game: it plays the matcher's part against YOUR
+// real endpoints, and asserts the wire contract in ThirdParty_Game_Integration_Contract_v1.md
+// (the "contract document"; section numbers below, such as §6, refer to it). Keep it in the
+// same folder as selftest-stub.mjs. It needs Node 18 or later and nothing else: every import
+// is a Node built-in.
+//
+//   1. node guest-conformance.mjs --self-test          # prove the harness bites (§7, step 1)
+//   2. MY_SECRET=… node guest-conformance.mjs --negative --secret-env MY_SECRET \
+//        --base-url https://<your functions origin> --play-url https://<your play origin> \
+//        --display-names declared      # or: declined — your game's declaration (§5)
+//
+// `--help` lists every flag. The contract document's §7 says what a clean run looks like.
 //
 // ⚠ IT ASSERTS CONSISTENCY WHERE A GUEST DECLARES A SHAPE; IT DOES NOT REQUIRE THE BEER
 // GAME'S. Roles, team names and costByRole are the guest's to declare or omit — where it
@@ -10,21 +21,19 @@
 // matcher reads, plus seats' teamId/playerId. (Loosened 2026-09-10: a correct single-role
 // guest used to fail. --self-test's conformant-single-role scenario holds that line.)
 //
-// ⚠ WHY THIS EXISTS. matcher-e2e.mjs tests the matcher against a MOCK Beer Game that it
-// also owns. That mock issues game codes like `BEER001` — containing 0 and 1, which the
-// REAL parseGameCode (/^[A-Z2-9]{4,8}$/) rejects outright — and the suite is green anyway.
-// A mock that is out of spec with the thing it stands in for cannot catch a contract
-// break. This harness speaks HTTP to the real deployment instead.
+// ⚠ WHY IT TALKS TO REAL ENDPOINTS. A test that runs against a mock of a game can agree with
+// the mock and still miss the real game. This project once had a mock that issued game codes
+// like `BEER001` — containing 0 and 1, which the real game's /^[A-Z2-9]{4,8}$/ rejects — and
+// its tests were green anyway. So this harness speaks HTTP to a real deployment.
 //
-// ⚠ IT IMPORTS NO BEERGAME SOURCE, ON PURPOSE. Its whole job is to test an implementation
-// we do not control. Importing the guest's own code would make it agree with itself, which
-// is exactly the failure mode above. Everything below is HTTP + JSON.
+// ⚠ IT IMPORTS NO GAME SOURCE, ON PURPOSE. Its whole job is to test an implementation it does
+// not control. Importing that implementation's own code would make it agree with itself.
+// Everything below is HTTP + JSON.
 //
-// ⚠ WRITTEN BEFORE THE HARDENING PASS, ON PURPOSE. Written afterwards it could only
-// confirm that the code does whatever the code then does. Today's wrong behaviours (the
-// unstructured 500s) are recorded as KNOWN-CURRENT baselines, not as passes and not as
-// failures. When hardening lands and a baseline moves, this prints BASELINE MOVED — that
-// is the harness watching the change happen, which is the point.
+// ⚠ KNOWN-CURRENT and BASELINE MOVED. The harness was first run against a guest that still
+// had known defects; those were recorded as KNOWN-CURRENT baselines rather than as passes or
+// failures, and a baseline that changes prints BASELINE MOVED. None of that applies to a v1
+// guest: it must pass every assertion, apart from the two standing SKIPs (§7).
 //
 // ── WHAT IT DRIVES ────────────────────────────────────────────────────────────────────
 //   discover seat count → provision → build deep link → claim seat → finalize →
@@ -32,44 +41,59 @@
 //   instance, with an unlisted "orphan" session that must be excluded)
 //
 // ── AUTH: TWO MODELS, DELIBERATELY NOT UNIFIED ────────────────────────────────────────
-//   provisionClassSession / finalizeClassSession / getClassResults
-//       Authorization: Bearer <matcher's PROVISION_SECRET_BEERGAME>   (server-to-server)
+//   provisionClassSession / finalizeClassSession / getClassResults / getClassGrades
+//       Authorization: Bearer <the shared secret>      (server-to-server; --secret-env)
 //   resumeClassPlayer
 //       plain HTTP with NO Authorization header — the signed seat token the matcher mints
 //       is the whole credential (D2/D3). The student never carries the shared secret.
 //
-// ── PASS C: THE FROZEN v1 ─────────────────────────────────────────────────────────────
-// Pass C (D5 explicit seat count, D6 verifiable seats, D9 results guard — its D4 "no names"
-// is reversed, see DISPLAY NAMES below) changed payload shape WITHOUT bumping
-// contract_version: nothing outside this project has
-// ever spoken the contract, so a bump would invent version history for revisions nobody
-// used. v1 freezes when the contract document ships. So the version CANNOT select pass C's
-// expectations — and this file does not try. v1's expectations ARE the frozen v1; a guest
-// that predates pass C fails them, and detectSeatCount() makes that failure name itself in
-// one line instead of a dozen unexplained reds.
+// ── LABELS IN THIS FILE ───────────────────────────────────────────────────────────────
+// Comments and assertion names carry the project's internal decision numbers. What each
+// means, and where the contract document covers it:
+//   D1      no compatibility shims: an older shape is refused, not tolerated        §1
+//   D2/D3   the seat claim needs a signed token, and is plain HTTP                  §3, §2.2
+//   D4      display names cross only when your game declares it receives them      §5
+//   D5      the seat count is sent explicitly; over-full refused, under-full reported  §4.3
+//   D6      the matcher verifies the seats your provision reply returns             §2.1
+//   D7/D8   contract_version on every request and reply; every error structured    §1, §4
+//   D9      results are refused for a session the classroom did not create          §2.4
+//   D10     a malformed results reply refuses the whole grading run                §2.4
+//   D12     one play origin builds both the student link and the report link       §2.5
+//   D13     each side names its copy of the shared secret as it likes              §1
+//   G1/G2   your game grades its whole class, once, keyed on the instance           §6
+//   G5      the matcher checks the grades' shape, never whether they make sense     §6.4
+//   (D11, score direction as matcher configuration, no longer exists: your game grades.)
+//   "pass C" — the last hardening round before v1 froze. A "pre-pass-C guest" is one built
+//   against an earlier draft of the contract.
+//   "tenant" — the matcher's configuration for one guest game (for you, your game).
 //
-// ── DISPLAY NAMES: DECLARED PER TENANT ────────────────────────────────────────────────
-// Whether a guest receives students' display names is its TENANT's declaration (matcher
-// tenants.ts receivesDisplayNames), not a contract version and not a default. Neither the
-// version nor the guest can tell the harness which to expect, so the harness is TOLD:
+// ── v1 AND ITS VERSION NUMBER ─────────────────────────────────────────────────────────
+// Several revisions before the freeze changed payload shapes WITHOUT bumping
+// contract_version: nothing outside the project had spoken the contract yet, so a bump would
+// have invented version history for revisions nobody used. v1 is now frozen (see the
+// contract document's header). So the version cannot select these expectations, and this
+// file does not try: v1's expectations ARE the frozen v1. A guest built against an earlier
+// draft fails them, and detectSeatCount() makes that failure name itself in one line instead
+// of a dozen unexplained reds.
+//
+// ── DISPLAY NAMES: DECLARED PER GAME ──────────────────────────────────────────────────
+// Whether your game receives students' display names is declared once for your game (§5), not
+// carried in the contract version and not a default. Neither the version nor your game can
+// tell the harness which to expect, so the harness is TOLD:
 //   --display-names declared   members carry displayName; the seat claim must return it
 //   --display-names declined   no names are sent;          the seat claim must carry none
-// Without the flag it reads the declaration from the matcher's own compiled tenant
-// (functions/lib/tenants.js) — and only when the base URL IS that tenant's guest. Anywhere
-// else a missing flag is fatal: guessing would pass a guest that leaks names, or fail one
-// that correctly withholds them.
+// ⚠ Always pass it. Against any guest except the Beer Game's own deployment, a missing flag
+// is fatal: guessing would pass a guest that leaks names, or fail one that correctly withholds
+// them. (Against the Beer Game, inside the mygames project, the harness can instead read the
+// declaration from the matcher's code. That path does not exist on your machine.)
 //
 // ── SECRETS ───────────────────────────────────────────────────────────────────────────
-// The harness acts as the MATCHER, so it needs the matcher's copy of the provision secret:
-//   project matcher-mygames-live, secret PROVISION_SECRET_BEERGAME
-// NOT beergame's differently-named copy (beergame-mygames-live/CLASSROOM_PROVISION_SECRET).
-// It is obtained through the mechanism scripts/set-matcher-secrets.sh already established
-// (see SECRETS.md). No value is ever typed, printed, logged, or written to a repo file.
-//
-// Usage:
-//   node tools/guest-conformance.mjs                 # happy-path arc
-//   node tools/guest-conformance.mjs --negative      # deliberate failures + baselines
-//   node tools/guest-conformance.mjs --negative --base-url https://...  # another deploy
+// The harness plays the matcher, so it needs the shared secret your server-to-server
+// endpoints check (§1). Put it in an environment variable and name that variable with
+// --secret-env. The value is never printed, logged, passed on a command line, or written to
+// a file; only an 8-character fingerprint is shown. (Without --secret-env, the harness looks
+// for the matcher's own copy of the Beer Game's secret, which only exists inside the mygames
+// project. If it finds nothing, it stops and tells you what to pass.)
 //
 // Requires Node 18+ (global fetch).
 
@@ -88,7 +112,7 @@ const MATCHER_ROOT = join(HERE, "..");
 const MATCHER_PROJECT = "matcher-mygames-live";
 const SECRET_NAME = "PROVISION_SECRET_BEERGAME";
 
-// ── CONTRACT VERSION + VERSION-KEYED EXPECTATIONS (spec D7/D8) ────────────────────────
+// ── CONTRACT VERSION + VERSION-KEYED EXPECTATIONS (D7/D8 — contract §1, §4) ───────────
 //
 // ⚠ WHY THIS REPLACED HARDCODED BASELINES. Until D7 there was nothing to ask the guest
 // about itself, so today's wrong behaviours were pinned as literals (`500`) that a human
@@ -101,7 +125,7 @@ const SECRET_NAME = "PROVISION_SECRET_BEERGAME";
 // because under the v1 set that 500 is a violation, not a baseline. Nobody has to notice.
 const CONTRACT_VERSION = 1;
 
-// ── SEAT TOKENS (spec D2) ─────────────────────────────────────────────────────
+// ── SEAT TOKENS (D2 — contract §3) ────────────────────────────────────────────
 // The harness acts as the MATCHER, so it MINTS. Canonicalisation is duplicated from
 // matcher functions/src/seatToken.ts and beergame functions/src/seatToken.ts on purpose —
 // a third party reimplements this from the contract document, and a harness that imported
@@ -294,22 +318,18 @@ guest-conformance.mjs — conformance harness against the REAL guest endpoints
 `);
 }
 
-// ── secret resolution — the Step-1 mechanism, no new one invented ──────────────────────
+// ── secret resolution ─────────────────────────────────────────────────────────────────
 //
-// handoff.ts resolves this secret two ways and we mirror both, plus the operator path:
-//
-//   production  PROVISION_SECRET.value()            — a defineSecret bound at deploy,
-//                                                     readable only inside Functions
-//   emulator    process.env[secretName]             — from functions/.secret.local
-//
-// This harness runs on a laptop, not inside Functions, so defineSecret is unavailable to
-// it. It uses the same two sources a developer already has, in the order that touches the
-// least: the emulator mirror that set-matcher-secrets.sh writes, then Secret Manager via
-// the exact gcloud call that script's read_src() uses.
+// Looked for, in order:
+//   1. the environment variable named by --secret-env. This is the path for your game.
+//   2. only inside the mygames project, testing the Beer Game: the matcher's local copy of its
+//      secret (functions/.secret.local), then Google Secret Manager through the gcloud CLI.
+//      Neither exists on your machine. If step 1 finds nothing, the harness stops with
+//      instructions rather than guessing.
 //
 // ⚠ The value is held in a local, never printed, never written anywhere, and never passed
 // as a command-line argument. Only an 8-char SHA-256 fingerprint is displayed, which is
-// enough to tell "the two projects hold different values" from "the endpoint is broken"
+// enough to tell "the two sides hold different values" from "the endpoint is broken"
 // without disclosing anything.
 
 function resolveSecret(envName = SECRET_NAME) {
@@ -611,8 +631,8 @@ async function runArc(opts, secret, expect) {
   }
   const gameCode = prov.json.gameCode;
 
-  // ⚠ The real regex, from the contract — NOT the mock's BEER001 shape, which this
-  // pattern rejects. If matcher-e2e's mock were driving this, the next line would fail.
+  // ⚠ The real regex, from the contract (§1). A mock game once issued codes like BEER001,
+  // which this pattern rejects; this is the line that catches a guest doing the same.
   check("gameCode matches the real /^[A-Z2-9]{4,8}$/", /^[A-Z2-9]{4,8}$/.test(gameCode), `got '${gameCode}'`);
 
   // D7: "Echoed in every response." Success bodies too, not only errors.
@@ -636,11 +656,9 @@ async function runArc(opts, secret, expect) {
   check("our groupId is echoed back, not replaced", seats.every((s) => s.groupId === groupId),
     `got ${JSON.stringify([...new Set(seats.map((s) => s.groupId))])}`);
 
-  // ⚠ Spec D6: "The matcher verifies the seats array the guest returns. The guest already
-  // returns it; the matcher currently discards it. It is the natural place to catch a
-  // hand-off that silently placed fewer students than it was given." handoff.ts reads only
-  // out.gameCode, so nothing in production makes this check — the harness does it here.
-  // This is also §5.2's "missing member" probe: --self-test drops one and this goes red.
+  // ⚠ D6 — the matcher verifies the seats array your provision reply returns (contract §2.1):
+  // every member it posted must get exactly one seat, or it refuses the hand-off. The harness
+  // makes the same check here. --self-test's `classic` scenario drops a member, and this goes red.
   const seatedIds = new Set(seats.map((s) => s.studentId));
   const unseated = members.filter((m) => !seatedIds.has(m.studentId));
   check("every posted member received a seat", unseated.length === 0,
@@ -850,7 +868,7 @@ async function runArc(opts, secret, expect) {
     claimedStudentId: claimed?.sessionToken ? target.studentId : null };
 }
 
-// ── getClassGrades — the guest grades its own class (addendum G1/G2) ───────────────────
+// ── getClassGrades — the guest grades its own class (G1/G2 — contract §6) ──────────────
 //
 // Keyed on the INSTANCE. The matcher lists the sessions it recorded; the guest grades exactly
 // those. ⚠ The ORPHAN below is what a refused hand-off (D6) leaves behind: a session carrying the
@@ -1084,8 +1102,8 @@ async function runNegative(opts, secret, expect) {
 
   // 8. D9 — getClassResults refuses a session the classroom did not provision.
   // ⚠ Honest limit, like finalize's re-fire: this harness can only CREATE classroom
-  // sessions, so it cannot produce the thing D9 refuses. Verified instead against an
-  // emulator with a seeded non-classroom game doc (see the pass-C session report).
+  // sessions, so it cannot produce the thing D9 refuses. The Beer Game's refusal was verified
+  // separately, on an emulator, against a seeded non-classroom session.
   record(SKIP, "results refuse a non-classroom session (D9)",
     "not observable over HTTP — this harness can only create classroom sessions.");
 
@@ -1097,7 +1115,7 @@ async function runNegative(opts, secret, expect) {
 // ── main ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * --self-test — spec §5.2/§5.4. Point the harness at a shipped, deliberately broken guest
+ * --self-test (contract §7, step 1). Point the harness at a shipped, deliberately broken guest
  * and require the named assertions to come back RED. A conformance harness that has never
  * failed is not known to be reading anything, so this runs BEFORE trusting a green run.
  *

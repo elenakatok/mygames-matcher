@@ -1,27 +1,33 @@
-// selftest-stub.mjs — the DELIBERATELY BROKEN guests, shipped on purpose.
+// selftest-stub.mjs — the DELIBERATELY BROKEN guests that `guest-conformance.mjs --self-test`
+// runs against. Keep this file in the same folder as guest-conformance.mjs; it imports only
+// Node built-ins.
 //
-// ⚠ THESE ARE NOT TEST DOUBLES FOR THE GUEST GAME. Do not point the harness at them to
-// "check the contract" — that is precisely the mistake matcher-e2e.mjs makes, and these
-// stubs are deliberately, visibly wrong so they can never be mistaken for the real thing.
+// ⚠ THESE ARE NOT TEST DOUBLES FOR YOUR GAME. Do not point the harness at them to "check the
+// contract": a stub that agrees with the harness proves nothing about a real game. They are
+// deliberately, visibly wrong so they can never be mistaken for the real thing.
 //
-// Hardening spec §5.2: "Its instrument proved by a deliberate failure. Point it at a wrong
-// secret, a malformed game code, and a missing member, and watch each one go red. A
-// conformance harness that has never failed is not known to be reading anything."
-// §5.4: "It must ship with the deliberate failing mode from (2) so he can prove his copy
-// bites before trusting it."
+// Why they exist (contract document §7, step 1): a conformance harness that has never been
+// seen to fail is not known to be reading anything. So the harness ships with guests that
+// break the contract on purpose — a wrong secret accepted, a malformed game code, a missing
+// member, and the rest listed below — and --self-test passes only if each defect goes red,
+// and each correct guest stays entirely green. Run it first, and watch it bite before you
+// trust a green run against your own game.
+//
+// Labels such as D5 or G1 are the project's internal decision numbers; the header of
+// guest-conformance.mjs maps each one to the contract document.
 //
 // ONE SCENARIO PER DEFECT, because the defects are mutually exclusive — a guest cannot both
 // omit contract_version and report v1 in the same run. Outside its own defect, every variant
-// implements the FROZEN v1 (pass C included), so each defect shows up in its own assertions
-// instead of spraying unrelated reds.
+// implements the FROZEN v1, so each defect shows up in its own assertions instead of
+// spraying unrelated reds.
 //
 //   conformant           NO defect, names declared — must draw zero failures
 //   conformant-declined  NO defect, names declined — must draw zero failures
 //   conformant-single-role  NO defect, NOT the Beer Game's shape: one 'player' role on every
-//                        seat (the stage family's shape), no team name on the claim, no
-//                        costByRole — must draw zero failures
+//                        seat (a game whose players are undifferentiated), no team name on
+//                        the claim, no costByRole — must draw zero failures
 //   conformant-roleless  NO defect, no role on any seat at all, names declined — zero failures
-//   classic     v1-correct EXCEPT the three §5.2 defects:
+//   classic     v1-correct EXCEPT three classic defects:
 //                 1. any Bearer accepted        → "wrong secret → 401" must go red
 //                 2. issues `BEER001`           → the game-code regex must go red
 //                 3. drops the last member      → the seat-coverage check must go red
@@ -30,26 +36,27 @@
 //   accepts-expired   verifies the signature but ignores `exp`
 //   lying-v1    reports v1 but answers a bad game code with an unstructured 500 — the exact
 //               pre-D8 behaviour production had on 2026-09-09
-//   ── pass C (D4, D5) ──
-//   undeclared-seat-count  no seat-count field at all — the PRE-PASS-C shape, still v1
+//   ── seat count and group shape (D5) ──
+//   undeclared-seat-count  no seat-count field at all — an earlier draft's shape, still
+//                          claiming v1
 //   ignores-seat-count     declares a seat count, then accepts any other
 //   truncates-overfull     slices an over-full group to its seats, silently (2026-09-09)
 //   skips-missing-id       skips a member with no studentId, silently (2026-09-09)
-//   silent-botfill         bot-fills an under-full group without saying so (found on
-//                          production 2026-09-09, missed by the extract)
-//   ── display names (per tenant) ──
+//   silent-botfill         bot-fills an under-full group without saying so (a real finding
+//                          on the Beer Game, 2026-09-09, since fixed)
+//   ── display names (D4) ──
 //   drops-declared-name    names declared, but the claim does not return the name it was
-//                          sent — pass C's guest, which D4's reversal undoes
+//                          sent (a real regression in an earlier draft, since fixed)
 //   names-despite-decline  names declined, yet the claim hands back a name anyway
 //   ── consistency, not the Beer Game's shape (2026-09-10) ──
 //   inconsistent-shape     the claim's role and teamId contradict provisioning, and
 //                          costByRole is present but not an object
 //   fails-matcher-validation  results the matcher's grading refuses: no players[].teamName
 //                          and a string teamCost — which the harness used to pass
-//   ── guest-owned grading (addendum G1/G2) ──
+//   ── grading (G1/G2 — contract §6) ──
 //   malformed-grade-row    getClassGrades returns a non-finite value and no label
 //   grades-include-unlisted  getClassGrades grades every session carrying the instance id,
-//                          a refused hand-off's orphan included (§6 Q7)
+//                          a refused hand-off's orphan included (contract §6.2)
 //
 // That lying-v1 case is the whole point of version-keying the expectations: under a
 // hardcoded baseline a 500 was "known-current" forever and nobody had to notice. Under v1
@@ -447,7 +454,7 @@ export const SELFTEST_SCENARIOS = [
       "…and its body is structured JSON with a stable code",
     ],
   },
-  // ── pass C ──────────────────────────────────────────────────────────────────────
+  // ── seat count and group shape (D5) ─────────────────────────────────────────────
   {
     variant: "undeclared-seat-count",
     what: "D5: a guest with no seat-count field at all — v1 in number, pre-pass-C in shape",
@@ -522,7 +529,7 @@ export const SELFTEST_SCENARIOS = [
       "results pass the matcher's grading validation (D10)",
     ],
   },
-  // ── guest-owned grading (addendum G1/G2) ─────────────────────────────────────────
+  // ── grading (G1/G2 — contract §6) ────────────────────────────────────────────────
   {
     variant: "malformed-grade-row",
     what: "getClassGrades returns a grade row with a non-finite value and no label",
