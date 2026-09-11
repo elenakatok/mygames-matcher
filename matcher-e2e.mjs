@@ -98,6 +98,8 @@ const asDev     = (gid, extra = {}) => ({ _dev: { game_instance_id: gid }, ...ex
 let cbServer = null
 let provisionRequests = []   // every hand-off body the mock Beer Game received
 let finalizeRequests = []    // every gameCode the mock Beer Game was asked to finalize
+const gradesRequests = []    // every getClassGrades body the matcher sent (G2: once per instance)
+let lastGrades = new Map()   // studentId → the grade row the mock guest last returned
 let gradePushes = []         // every gradebook row the MATCHER pushed to the mock classroom
 let membersByCode = {}       // gameCode → the human members provisioned into it (for mock results)
 let rosterRequests = 0
@@ -132,6 +134,27 @@ function mockResultsFor(code) {
   }))
   return { contract_version: 1, ok: true, gameCode: code, teams: [{ teamId: 'team1', teamName: `Mock Team ${suffix}`, teamCost }], players }
 }
+
+// The mock Beer Game GRADES ITS OWN CLASS (getClassGrades, addendum G1/G2): the team-cost z,
+// pooled in the order the matcher lists the sessions — the same rule beergame's classGrades.ts
+// applies. The matcher must relay these values untouched; the modes make it lie on purpose.
+function mockGradesFor(req) {
+  const codes = Array.isArray(req?.gameCodes) ? req.gameCodes : []
+  const people = codes.flatMap((code) => mockResultsFor(code).players.map((p) => ({ ...p, code })))
+  const pool = new Map()
+  for (const p of people) pool.set(`${p.code}:${p.teamId}`, p.teamCost)
+  const xs = [...pool.values()]
+  const n = xs.length
+  const mean = n ? xs.reduce((a, b) => a + b, 0) / n : 0
+  const std = Math.sqrt(n ? xs.reduce((a, b) => a + (b - mean) ** 2, 0) / n : 0)
+  const z = (v) => (std > 0 ? Number(((-1 * (v - mean)) / std).toFixed(4)) + 0 : 0)
+  let grades = people.map((p) => ({ studentId: p.studentId, value: p.participated ? z(p.teamCost) : null,
+    label: 'Team cost z-score (lower cost is better)' }))
+  if (mockMode === 'backwards') grades = grades.map((g) => ({ ...g, value: g.value === null ? null : -g.value + 0, label: 'backwards on purpose' }))
+  if (mockMode === 'malformed-grades') grades = grades.map((g, i) => (i === 0 ? { ...g, value: 'NaN' } : g))
+  if (mockMode === 'grades-missing-student') grades = grades.slice(0, -1)
+  return { contract_version: 1, ok: true, instanceId: req?.instanceId, grades }
+}
 const ROSTER = [
   { participant_id: 'stu1', name: 'Ada Lovelace',    email: 'ada@example.edu',   external_id: 'stu1' },
   { participant_id: 'stu2', name: 'Alan Turing',     email: 'alan@example.edu',  external_id: 'stu2' },
@@ -156,7 +179,19 @@ function startClassroom() {
           r.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
           r.end('<!doctype html><html><head><title>myGames Classroom</title></head><body></body></html>'); return
         }
+        // Unreachable-guest modes: a 500 from finalize, results or grades must refuse the WHOLE run.
+        const fail500 = (m) => { r.writeHead(500, { 'Content-Type': 'application/json' }); r.end(JSON.stringify({ contract_version: 1, error: { code: 'INTERNAL', message: m } })) }
+        if (mockMode === 'finalize-500' && url.endsWith('/finalize')) { finalizeRequests.push(parsed?.gameCode); return fail500('mock finalize failure') }
+        if (mockMode === 'results-500' && url.endsWith('/results')) return fail500('mock results failure')
+        if (mockMode === 'grades-500' && url.endsWith('/grades')) { gradesRequests.push(parsed); return fail500('mock grades failure') }
         r.writeHead(200, { 'Content-Type': 'application/json' })
+        // /grades — the guest grades its own class, once per instance (getClassGrades).
+        if (url.endsWith('/grades')) {
+          gradesRequests.push(parsed)
+          const reply = mockGradesFor(parsed)
+          lastGrades = new Map(reply.grades.map((g) => [g.studentId, g]))
+          r.end(JSON.stringify(reply)); return
+        }
         // The mock BEER GAME hand-off (/provision): a hand-off carries `groups` — answer with
         // a game code and remember which humans went into it (so /results can echo their costs).
         // ⚠ The mock speaks the FROZEN v1 now (pass C): a contract-shaped gameCode (the old
@@ -228,6 +263,7 @@ async function bringUp() {
              PROVISION_URL_OVERRIDE: `${CB}/provision`,
              FINALIZE_URL_OVERRIDE: `${CB}/finalize`,
              RESULTS_URL_OVERRIDE: `${CB}/results`,
+             GRADES_URL_OVERRIDE: `${CB}/grades`,
              CALLBACK_URL_OVERRIDE: `${CB}/game-results`,
              PROVISION_SECRET_BEERGAME: PROVISION_SECRET,
              CALLBACK_SECRET_BEERGAME: 'test-callback-secret' } }))
@@ -358,6 +394,7 @@ async function classroomFlow() {
   // gradebook row per HUMAN (raw_score = individual cost, normalized_score = team z), WITHOUT
   // waiting for the game to finish. Re-runnable.
   finalizeRequests.length = 0
+  gradesRequests.length = 0
   gradePushes = []
   const sr = await scoreAndRecord(gid);         check(sr.ok && sr.result.scored === 4, `14. scoreAndRecord grades all 4 present players — scored ${sr.result?.scored ?? sr.error}`)
   check(finalizeRequests.length === 1 && finalizeRequests[0] === gdoc?.gameCode, `15. mock Beer Game got finalize for the gameCode — ${finalizeRequests.join(',')}`)
@@ -365,8 +402,15 @@ async function classroomFlow() {
   check(gradePushes.length === 4, `16. four gradebook rows pushed — ${gradePushes.length}`)
   const allHaveCost = gradePushes.every((p) => typeof p.raw_score === 'number' && p.status === 'completed' && p.game_instance_id === gid)
   check(allHaveCost, `17. every grade row carries raw_score (individual cost) + completed status`)
-  // Single team → std 0 → every z is 0 (documented behaviour when all teams cost the same).
-  check(gradePushes.every((p) => p.normalized_score === 0), `18. single-team cohort → z=0 for all (std 0)`)
+  // G1 — the matcher RELAYS the guest's grades and computes nothing: ONE getClassGrades call for
+  // the instance, listing its recorded session, and every pushed normalized_score is exactly the
+  // value the guest returned for that student, with its label carried in details.
+  check(gradesRequests.length === 1 && gradesRequests[0]?.instanceId === gid &&
+    JSON.stringify(gradesRequests[0]?.gameCodes) === JSON.stringify([gdoc?.gameCode]),
+    `18. one getClassGrades call for the instance, listing its one session — ${JSON.stringify(gradesRequests.map((g) => g.gameCodes))}`)
+  check(gradePushes.length === 4 && gradePushes.every((p) => lastGrades.has(p.participant_id) &&
+    p.normalized_score === lastGrades.get(p.participant_id).value && p.details?.grade_label === lastGrades.get(p.participant_id).label),
+    `18a. every pushed normalized_score is the guest's own value, label carried — ${gradePushes.map((p) => p.normalized_score).join(',')}`)
   // Outcome column: the matcher wrote raw_score onto its own participant docs.
   const rosterAfter = await getRoster(gid)
   const withOutcome = (rosterAfter.result?.participants ?? []).filter((p) => typeof p.raw_score === 'number')
@@ -476,19 +520,29 @@ async function onlineFlow() {
   // Grade the online cohort — ≥2 teams with DISTINCT costs, so the z-score has a real spread
   // (this is the multi-team case the whole feature exists for; the classroom flow was 1 team).
   gradePushes = []
+  gradesRequests.length = 0
   const sr = await scoreAndRecord(gid)
-  check(sr.ok && (sr.result.cohort?.teams ?? 0) >= 2, `10. scoreAndRecord pooled ≥2 teams — ${sr.result?.cohort?.teams ?? sr.error} teams, mean ${sr.result?.cohort?.meanTeamCost}`)
-  check((sr.result?.cohort?.stdTeamCost ?? 0) > 0, `11. distinct team costs → non-zero std (${sr.result?.cohort?.stdTeamCost})`)
-  // Lower team cost → higher (positive) z; higher cost → negative. Both signs must appear.
+  // G2 — ONE grade call for the whole instance, listing every session the matcher recorded.
+  const recordedCodes = []
+  for (const g of (await getOnline(gid)).result?.groups ?? []) { const d = await groupDoc(gid, g.group_id); if (d?.gameCode) recordedCodes.push(d.gameCode) }
+  const listed = gradesRequests[0]?.gameCodes ?? []
+  check(sr.ok && gradesRequests.length === 1 && gradesRequests[0]?.instanceId === gid && recordedCodes.length >= 2 &&
+    listed.length === recordedCodes.length && recordedCodes.every((c) => listed.includes(c)),
+    `10. ONE getClassGrades call for the instance, listing all ${recordedCodes.length} recorded sessions — ${sr.ok ? JSON.stringify(listed) : sr.error}`)
+  // G1 — the matcher computes nothing: every pushed normalized_score is exactly the guest's value.
+  check(gradePushes.length > 0 && gradePushes.every((p) => lastGrades.has(p.participant_id) && p.normalized_score === lastGrades.get(p.participant_id).value),
+    `11. every pushed normalized_score is exactly the guest's value — nothing recomputed (G1)`)
   const zs = gradePushes.map((p) => p.normalized_score).filter((z) => typeof z === 'number')
-  check(zs.some((z) => z > 0) && zs.some((z) => z < 0), `12. z-scores span both signs (better + worse teams) — ${[...new Set(zs)].sort((a, b) => a - b).join(', ')}`)
-  // D11: direction is tenant data — lower_is_better for the Beer Game — so the CHEAPEST team
-  // must hold the highest z. Check 12 would still pass with the class graded backwards;
-  // this one would not.
-  const byCost = gradePushes.filter((p) => typeof p.details?.team_cost === 'number')
-    .sort((a, b) => a.details.team_cost - b.details.team_cost)
-  check(byCost.length >= 2 && byCost[0].normalized_score > 0 && byCost[byCost.length - 1].normalized_score < 0,
-    `12a. cheapest team z>0, costliest z<0 (lower_is_better, D11) — ${byCost.map((p) => `${p.details.team_cost}:${p.normalized_score}`).join(' ')}`)
+  check(zs.some((z) => z > 0) && zs.some((z) => z < 0), `12. the relayed grades carry a real spread (${[...new Set(zs)].sort((a, b) => a - b).join(', ')}), so 11 compared non-trivial values`)
+  // G5 — shape, never sensibility: a guest that grades BACKWARDS is relayed as given, and nothing
+  // on the matcher's side objects. That is the accepted price of G1.
+  mockMode = 'backwards'
+  gradePushes = []
+  const srBack = await scoreAndRecord(gid)
+  check(srBack.ok && gradePushes.length > 0 && gradePushes.some((p) => p.normalized_score !== 0) &&
+    gradePushes.every((p) => p.normalized_score === lastGrades.get(p.participant_id).value && p.details?.grade_label === 'backwards on purpose'),
+    `12a. a guest that grades BACKWARDS is pushed as given — nothing objects (G5, the accepted price)`)
+  mockMode = 'ok'
   // Every pushed row still carries the individual cost as raw_score.
   check(gradePushes.every((p) => typeof p.raw_score === 'number'), `13. every online grade row carries raw_score (individual cost)`)
 }
@@ -550,6 +604,28 @@ async function contractFlow() {
   const srOk = await scoreAndRecord(gid)
   check(srOk.ok && srOk.result?.push?.succeeded === 4 && srOk.result?.push?.failed?.length === 0,
     `12. a receiver that confirms each row: all 4 stored — succeeded ${srOk.result?.push?.succeeded}`)
+
+  // ⚠ GUEST-OWNED GRADING IS ALL-OR-NOTHING: any failure refuses the WHOLE run before one grade
+  // is pushed. Each case names its reason on the button.
+  const refusals = [
+    ['malformed-grades', /malformed grades/i, '13. a grade row with a non-finite value REFUSES the whole run (G5)'],
+    ['grades-missing-student', /malformed grades.*no grade row/i, '14. a grade set missing a student the matcher sent REFUSES the whole run (G5)'],
+    ['grades-500', /grades could not be read/i, '15. an unreachable grades reply REFUSES the whole run'],
+    ['finalize-500', /could not be ended/i, '16. a session that FAILED TO FINALIZE refuses the run (§6 Q6, decided: refuse)'],
+    ['results-500', /results for session .* could not be read/i, '17. an unreachable results reply REFUSES the whole run'],
+  ]
+  for (const [mode, re, name] of refusals) {
+    mockMode = mode
+    gradePushes = []
+    const r = await scoreAndRecord(gid)
+    check(!r.ok && re.test(r.error ?? '') && gradePushes.length === 0,
+      `${name} — ${r.ok ? `GRADED ANYWAY (${gradePushes.length} pushes)` : (r.error ?? '').slice(0, 110)}; pushes ${gradePushes.length}`)
+  }
+  mockMode = 'ok'
+  gradePushes = []
+  const srHealthy = await scoreAndRecord(gid)
+  check(srHealthy.ok && srHealthy.result?.push?.succeeded === 4,
+    `18. with the guest healthy again, the same button grades all 4 — succeeded ${srHealthy.result?.push?.succeeded ?? srHealthy.error}`)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

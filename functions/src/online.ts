@@ -31,12 +31,14 @@ import {
   provisionGroupToTenant,
   finalizeGuestSession,
   getGuestResults,
+  getGuestGrades,
   mintSeatLink,
   MalformedGuestResultsError,
+  MalformedGuestGradesError,
   PROVISION_SECRET,
   type GuestResultPlayer,
+  type GuestGradeRow,
 } from "./handoff";
-import { cohortScore } from "./scoring";
 import { planHandOff, type GroupHandOffPlan, type HandOffOutcome, type WaitingMember } from "./handoffPlan";
 import { HttpsError } from "firebase-functions/v2/https";
 
@@ -214,17 +216,6 @@ export const getOnlineReport = makeGetOnlineReport(ctx, {
   absenceLabel: "Not yet arrived",
 });
 
-/**
- * "Finalize & record" — the dashboard's always-available, re-runnable Finalize button.
- *
- * The matcher never grades; the guest game does, pushing participation grades when its session
- * ENDS. So finalizing here = ending every handed-off guest session (finalizeGuestSession),
- * which triggers each one's grade push. ⚠ IT DOES NOT WAIT FOR EVERYONE TO FINISH — that is
- * the whole point: a team whose member left never ends on its own, so without this the
- * students who DID take part are never graded. Ending a still-running session grades everyone
- * present (the guest scores absentees/bots out). Idempotent: an already-ended session returns
- * ok and is not re-pushed, so the button is safe to click repeatedly as more groups finish.
- */
 /** One grade row pushed to the classroom's receiveGameResult callback. */
 interface GradeRow {
   game_instance_id: string;
@@ -232,7 +223,7 @@ interface GradeRow {
   status: "completed" | "no_show";
   role: string | null;
   raw_score: number | null; // Outcome column = the student's INDIVIDUAL cost
-  normalized_score: number | null; // z-score of the student's TEAM outcome (positive = better team; direction is tenant data, D11)
+  normalized_score: number | null; // THE GRADE: the guest's value, pushed as given (G1). The gradebook renders exactly this field.
   knowledge_check_score: number | null;
   details: Record<string, unknown>;
 }
@@ -272,17 +263,31 @@ async function pushGrade(row: GradeRow, url: string, secret: string): Promise<vo
 }
 
 /**
- * scoreAndRecord — the instructor's "Finalize & record" button. The matcher is the GRADER for
- * its guest game (the guest can only see one team; the z-score needs every team). Steps:
- *   1. End every handed-off guest session (freeze costs) — idempotent, safe on already-ended.
- *   2. Read every team's + player's costs (getGuestResults / Beer Game getClassResults).
- *   3. Pool the TEAM costs across all groups → mean/std → each team's z-score
- *      (a positive z is a better-than-average team; which way "better" points is the tenant's
- *      scoreDirection, D11 — the Beer Game is lower_is_better; std 0 → all z 0).
- *   4. Per human player: write raw_score = their INDIVIDUAL cost + finalized_at on the matcher
- *      participant doc (drives the dashboard Outcome column), and push a gradebook row
- *      (raw_score = individual cost, normalized_score = team z) to the classroom.
- * Re-runnable: every call recomputes from current guest state and re-pushes (upsert).
+ * scoreAndRecord — the instructor's "Finalize & record" button. Re-runnable.
+ *
+ * ⚠ THE MATCHER RELAYS GRADES; IT DOES NOT COMPUTE THEM. Guest_Owned_Grading_Spec_Addendum_v1.md
+ * G1 — "The guest owns grading completely." Until this pass the matcher z-scored the guest's team
+ * costs here itself (scoring.ts, deleted) — a rule inherited from the negotiation family and never
+ * chosen for any guest. Now:
+ *   1. End every session the matcher recorded (idempotent; safe on already-ended).
+ *   2. Read each session's results — ONLY for the dashboard's Outcome column (raw_score = the
+ *      student's individual cost). The grade does not come from here.
+ *   3. Ask the guest ONCE for the whole instance's grades (getClassGrades), listing the sessions
+ *      the matcher recorded, and validate SHAPE only (G5): one row per student it sent, a finite
+ *      number (or null: no grade), a label. ⚠ Never sensibility — a guest that grades backwards
+ *      has backwards grades pushed and nothing here objects. That is G1's accepted price.
+ *   4. Write raw_score + finalized_at on each participant doc and push each row with
+ *      normalized_score = the guest's value AS GIVEN (the one field the gradebook renders).
+ *
+ * ⚠ ALL-OR-NOTHING. Every failure in 1–3 refuses the WHOLE run before one grade is written or
+ * pushed: a session that did not end, an unreachable or malformed results or grades reply, a
+ * results or grade set that does not match who was sent. This replaces D10's per-session
+ * tolerance for an unreachable session — with one grade call per instance there is no partial
+ * cohort left to tolerate.
+ *
+ * ⚠ §6 Q6, DECIDED HERE: a session that FAILED TO FINALIZE refuses the run. The grades are
+ * relative across the class, so one session whose costs are still moving shifts every other
+ * student's grade; and the button is re-runnable, so a refusal costs a retry, never a wrong grade.
  */
 export const scoreAndRecord = onCall(
   { cors: matcherGameDef.corsOrigins, secrets: [PROVISION_SECRET, CALLBACK_SECRET] },
@@ -295,61 +300,75 @@ export const scoreAndRecord = onCall(
     );
     const instRef = db().collection("game_instances").doc(iid);
     const groupsSnap = await instRef.collection("groups").get();
-    const codes = groupsSnap.docs
-      .map((d) => (d.data() as Record<string, unknown>)["gameCode"])
-      .filter((c): c is string => typeof c === "string" && c.length > 0);
+    // The sessions the matcher RECORDED — its accepted hand-offs, in group-id order — and whom it
+    // sent into each (humans only; bots never cross). The guest grades exactly these sessions,
+    // pooling in this order, which is what keeps its z bit-for-bit the one computed here before.
+    const recorded = groupsSnap.docs
+      .map((d) => d.data() as Record<string, unknown>)
+      .filter((g) => typeof g["gameCode"] === "string" && (g["gameCode"] as string).length > 0)
+      .map((g) => {
+        const seats = Array.isArray(g["player_participants"]) ? (g["player_participants"] as string[]) : [];
+        const bots = new Set(Array.isArray(g["bot_participants"]) ? (g["bot_participants"] as string[]) : []);
+        return { code: g["gameCode"] as string, sent: seats.filter((pid) => !bots.has(pid)) };
+      });
+    const codes = recorded.map((s) => s.code);
+    const sentStudentIds = recorded.flatMap((s) => s.sent);
+    const refusal = (why: string) => new HttpsError("failed-precondition", `${why} Nothing was graded.`);
+    const reasonOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-    // 1. End every guest session so its costs are final. Non-fatal per code — a session we
-    //    cannot end still has readable (interim) costs, and grading is re-runnable.
-    let finalized = 0;
+    if (codes.length === 0) {
+      return {
+        ok: true as const, scored: 0,
+        push: { total: 0, succeeded: 0, failed: [] },
+        finalize: { total: 0, succeeded: 0, failed: [] },
+      };
+    }
+
+    // 1. End every recorded session, so its outcomes are final (§6 Q6: any failure refuses).
     const finalizeFailed: Array<{ code: string; reason: string }> = [];
     for (const code of codes) {
-      try { await finalizeGuestSession(code); finalized += 1; }
-      catch (e) { finalizeFailed.push({ code, reason: e instanceof Error ? e.message : String(e) }); }
+      try { await finalizeGuestSession(code); }
+      catch (e) { finalizeFailed.push({ code, reason: reasonOf(e) }); }
     }
-
-    // 2. Read costs for every session.
-    const results: Array<{ code: string; players: GuestResultPlayer[] }> = [];
-    const resultsFailed: Array<{ code: string; reason: string }> = [];
-    const malformed: Array<{ code: string; reason: string }> = [];
-    for (const code of codes) {
-      try { const r = await getGuestResults(code); results.push({ code, players: r.players }); }
-      catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        if (e instanceof MalformedGuestResultsError) malformed.push({ code, reason });
-        else resultsFailed.push({ code, reason });
-      }
-    }
-    // ⚠ D10 — "Malformed results fail loudly." A wrong-SHAPED reply is a contract break on
-    // the guest's side, so it hits every session that guest serves, and grading the rest
-    // would z-score the class against a cohort with teams silently missing. Refuse the whole
-    // run — before one grade is written or pushed — and say why on the button. (An
-    // UNREACHABLE session, an HTTP error, keeps the old per-session tolerance: it is reported
-    // in results.failed and the button is re-runnable.)
-    if (malformed.length > 0) {
-      throw new HttpsError(
-        "failed-precondition",
-        `The guest game returned malformed results for ${malformed.length} of ${codes.length} ` +
-        `session(s), so nothing was graded. ${malformed[0].reason}`,
+    if (finalizeFailed.length > 0) {
+      throw refusal(
+        `${finalizeFailed.length} of ${codes.length} session(s) could not be ended, so their outcomes are ` +
+        `not final (${finalizeFailed[0].code}: ${finalizeFailed[0].reason}).`,
       );
     }
 
-    // 3. Pool the distinct TEAM costs (one data point per team that has a human) → mean/std.
-    const teamCostByKey = new Map<string, number>();
-    for (const { code, players } of results) {
-      for (const p of players) {
-        if (p.teamId != null && typeof p.teamCost === "number") {
-          teamCostByKey.set(`${code}:${p.teamId}`, p.teamCost);
-        }
+    // 2. Results — the Outcome column only. D10: a wrong-SHAPED reply is refused loudly, and now
+    //    an unreachable one is too.
+    const results: Array<{ code: string; players: GuestResultPlayer[] }> = [];
+    for (const code of codes) {
+      try { results.push({ code, players: (await getGuestResults(code)).players }); }
+      catch (e) {
+        throw refusal(e instanceof MalformedGuestResultsError
+          ? `The guest game returned malformed results for session ${code}. ${reasonOf(e)}`
+          : `The guest game's results for session ${code} could not be read (${reasonOf(e)}).`);
       }
     }
-    const teamCosts = [...teamCostByKey.values()];
-    // D11 — the direction is TENANT DATA (tenants.ts scoreDirection), not code. For the Beer
-    // Game a lower total cost is the better team and so gets the positive z; a points game
-    // declares higher_is_better. std 0 (all teams equal) → every z is 0.
-    const { mean, std, zFor } = cohortScore(teamCosts, ACTIVE_TENANT.scoreDirection);
+    const resultIds = results.flatMap((r) => r.players.map((p) => p.studentId));
+    const sentSet = new Set(sentStudentIds);
+    const resultSet = new Set(resultIds);
+    if (resultSet.size !== resultIds.length || resultSet.size !== sentSet.size || !resultIds.every((sid) => sentSet.has(sid))) {
+      throw refusal(
+        `The guest game's results list ${resultIds.length} student row(s); the matcher sent ${sentSet.size} ` +
+        `student(s) into these sessions.`,
+      );
+    }
 
-    // 4. Grade each human player: Outcome = individual cost, gradebook z = team z.
+    // 3. The grades — ONCE, for the whole instance. Shape only (G5).
+    let grades: GuestGradeRow[];
+    try { grades = await getGuestGrades(iid, codes, sentStudentIds); }
+    catch (e) {
+      throw refusal(e instanceof MalformedGuestGradesError
+        ? `The guest game returned malformed grades. ${reasonOf(e)}`
+        : `The guest game's grades could not be read (${reasonOf(e)}).`);
+    }
+    const gradeById = new Map(grades.map((g) => [g.studentId, g]));
+
+    // 4. Write the Outcome column and push each grade AS GIVEN.
     // ⚠ EMULATOR ONLY: the e2e harness points the grade push at its mock classroom. Gated on
     // FUNCTIONS_EMULATOR (like PROVISION_URL_OVERRIDE) so a deployed matcher can never be
     // redirected away from the real classroom — and because functions/.env pins
@@ -368,9 +387,10 @@ export const scoreAndRecord = onCall(
 
     for (const { players } of results) {
       for (const p of players) {
+        // Verified above: every student sent has exactly one grade row and one results row.
+        const grade = gradeById.get(p.studentId) as GuestGradeRow;
         const participated = p.participated;
         const individualCost = typeof p.individualCost === "number" ? p.individualCost : null;
-        const teamZ = typeof p.teamCost === "number" ? zFor(p.teamCost) : null;
 
         // Dashboard Outcome column + finalized tick (matcher participant doc).
         await partCol.doc(p.studentId).set(
@@ -386,16 +406,18 @@ export const scoreAndRecord = onCall(
         const row: GradeRow = {
           game_instance_id: iid,
           participant_id: p.studentId,
+          // status is required by receiveGameResult and read by nothing (addendum §3); it keeps
+          // its meaning — did the student take their seat.
           status: participated ? "completed" : "no_show",
           role: p.role,
           raw_score: participated ? individualCost : null,
-          normalized_score: participated ? teamZ : null,
+          normalized_score: grade.value, // THE GRADE, exactly as the guest gave it (G1)
           knowledge_check_score: null,
           details: {
             team_name: p.teamName,
             team_cost: p.teamCost,
             individual_cost: individualCost,
-            team_z: teamZ,
+            grade_label: grade.label,
           },
         };
         try { await pushGrade(row, url, secret); pushed += 1; }
@@ -408,9 +430,7 @@ export const scoreAndRecord = onCall(
       ok: true as const,
       scored: graded,
       push: { total: graded, succeeded: pushed, failed: pushFailed },
-      finalize: { total: codes.length, succeeded: finalized, failed: finalizeFailed },
-      results: { failed: resultsFailed },
-      cohort: { teams: teamCosts.length, meanTeamCost: Number(mean.toFixed(2)), stdTeamCost: Number(std.toFixed(2)) },
+      finalize: { total: codes.length, succeeded: codes.length, failed: [] },
     };
   },
 );

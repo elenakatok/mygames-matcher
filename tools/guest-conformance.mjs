@@ -28,7 +28,8 @@
 //
 // ── WHAT IT DRIVES ────────────────────────────────────────────────────────────────────
 //   discover seat count → provision → build deep link → claim seat → finalize →
-//   finalize again → read results
+//   finalize again → read results → read the CLASS's grades (getClassGrades, keyed on the
+//   instance, with an unlisted "orphan" session that must be excluded)
 //
 // ── AUTH: TWO MODELS, DELIBERATELY NOT UNIFIED ────────────────────────────────────────
 //   provisionClassSession / finalizeClassSession / getClassResults
@@ -149,6 +150,34 @@ function matcherResultsProblem(o, gameCode) {
       return `players[${i}] teamCost/individualCost must be number or null`;
     }
   }
+  return null;
+}
+
+/**
+ * The matcher's getClassGrades validation — functions/src/handoff.ts verifyGuestGrades (G5) —
+ * DUPLICATED on purpose, like matcherResultsProblem above. Shape, never sensibility: one row per
+ * student sent, a finite number or null, a label. ⚠ If verifyGuestGrades changes, change this.
+ */
+function matcherGradesProblem(o, instanceId, sentStudentIds) {
+  if (!o || typeof o !== "object") return "the reply is not a JSON object";
+  if (o.ok !== true) return `ok is ${JSON.stringify(o.ok)}, not true`;
+  if (o.instanceId !== instanceId) return `it answers for instance ${JSON.stringify(o.instanceId)}`;
+  if (!Array.isArray(o.grades)) return "grades is not an array";
+  const sent = new Set(sentStudentIds);
+  const seen = new Set();
+  for (const [i, g] of o.grades.entries()) {
+    const r = g ?? {};
+    if (typeof r.studentId !== "string" || !r.studentId) return `grades[${i}].studentId is missing`;
+    if (!sent.has(r.studentId)) return `grades[${i}] is for ${r.studentId}, a student the matcher never sent`;
+    if (seen.has(r.studentId)) return `${r.studentId} is graded twice`;
+    seen.add(r.studentId);
+    if (!(r.value === null || (typeof r.value === "number" && Number.isFinite(r.value)))) {
+      return `grades[${i}].value for ${r.studentId} is ${JSON.stringify(r.value)}, not a finite number or null`;
+    }
+    if (typeof r.label !== "string" || !r.label.trim()) return `grades[${i}].label for ${r.studentId} is missing`;
+  }
+  const missing = sentStudentIds.filter((s) => !seen.has(s));
+  if (missing.length) return `${missing.length} student(s) sent got no grade row: ${missing.join(", ")}`;
   return null;
 }
 
@@ -817,7 +846,62 @@ async function runArc(opts, secret, expect) {
       `participated=${row?.participated}`);
   }
 
-  return { gameCode, instanceId, members, teams: teams.length, fatal: false };
+  return { gameCode, instanceId, members, teams: teams.length, fatal: false,
+    claimedStudentId: claimed?.sessionToken ? target.studentId : null };
+}
+
+// ── getClassGrades — the guest grades its own class (addendum G1/G2) ───────────────────
+//
+// Keyed on the INSTANCE. The matcher lists the sessions it recorded; the guest grades exactly
+// those. ⚠ The ORPHAN below is what a refused hand-off (D6) leaves behind: a session carrying the
+// SAME instance id that the matcher never recorded. It is provisioned and deliberately NOT listed,
+// and none of its students may be graded.
+async function runGrades(opts, secret, expect, arc) {
+  console.log(`\n── GRADES ── getClassGrades for instance ${arc.instanceId}\n`);
+  const orphanMember = { studentId: `${arc.instanceId}-orphan-1`,
+    ...(expect.displayNames === "declared" ? { displayName: "Orphan Student" } : {}) };
+  const orphan = await callGuest(opts.baseUrl, "provisionClassSession",
+    { instanceId: arc.instanceId, seatCount: expect.seatCount ?? 1,
+      groups: [{ groupId: `orphan-${Date.now()}`, members: [orphanMember] }] }, secret);
+  const orphanCode = orphan.json?.gameCode ?? null;
+  if (orphanCode) await callGuest(opts.baseUrl, "finalizeClassSession", { gameCode: orphanCode }, secret);
+
+  const gr = await callGuest(opts.baseUrl, "getClassGrades", { instanceId: arc.instanceId, gameCodes: [arc.gameCode] }, secret);
+  check("getClassGrades returns 2xx", gr.status >= 200 && gr.status < 300, `HTTP ${gr.status}: ${gr.text.slice(0, 200)}`);
+  if (expect.versionEchoed) {
+    check("grades response echoes contract_version", gr.json?.contract_version === CONTRACT_VERSION,
+      `got contract_version=${JSON.stringify(gr.json?.contract_version)}`);
+  }
+  const problem = matcherGradesProblem(gr.json, arc.instanceId, arc.members.map((m) => m.studentId));
+  check("grade rows pass the matcher's grade validation (G5)", problem === null, problem ?? "");
+  const rows = Array.isArray(gr.json?.grades) ? gr.json.grades : [];
+  // ⚠ Conditioned on a 2xx: with no rows at all (an endpoint that is missing or failing) "the
+  // orphan is not in the rows" would be true of nothing, and pass vacuously.
+  check("sessions not listed are excluded (a refused hand-off's orphan)",
+    gr.status >= 200 && gr.status < 300 && rows.length > 0 && orphanCode !== null &&
+      !rows.some((r) => r?.studentId === orphanMember.studentId),
+    orphanCode === null ? `could not provision the orphan: HTTP ${orphan.status} ${orphan.text.slice(0, 120)}`
+      : `the unlisted orphan's student was graded: ${JSON.stringify(rows.find((r) => r?.studentId === orphanMember.studentId))}`);
+  if (arc.claimedStudentId) {
+    const row = rows.find((r) => r?.studentId === arc.claimedStudentId);
+    check("a student who claimed their seat has a finite grade", typeof row?.value === "number" && Number.isFinite(row.value),
+      JSON.stringify(row ?? null));
+  }
+  if (!opts.negative) return { orphanCode };
+
+  const expectErr = (name, res, status, code) =>
+    check(name, res.status === status && res.json?.error?.code === code, `HTTP ${res.status}: ${res.text.slice(0, 160)}`);
+  expectErr("grades with NO instanceId → 400 INSTANCE_ID_REQUIRED",
+    await callGuest(opts.baseUrl, "getClassGrades", { gameCodes: [arc.gameCode] }, secret), 400, "INSTANCE_ID_REQUIRED");
+  expectErr("grades with NO gameCodes → 400 GAME_CODES_REQUIRED",
+    await callGuest(opts.baseUrl, "getClassGrades", { instanceId: arc.instanceId }, secret), 400, "GAME_CODES_REQUIRED");
+  expectErr("a session from another instance → 409 SESSION_NOT_IN_INSTANCE",
+    await callGuest(opts.baseUrl, "getClassGrades", { instanceId: `${arc.instanceId}-other`, gameCodes: [arc.gameCode] }, secret),
+    409, "SESSION_NOT_IN_INSTANCE");
+  expectErr("grades with a wrong secret → 401",
+    await callGuest(opts.baseUrl, "getClassGrades", { instanceId: arc.instanceId, gameCodes: [arc.gameCode] }, "wrong-secret-on-purpose"),
+    401, "UNAUTHORIZED");
+  return { orphanCode };
 }
 
 // ── the negative suite — this matters more than the happy path ────────────────────────
@@ -1060,7 +1144,8 @@ async function runSelfTest(opts) {
 
     const stubOpts = { ...opts, baseUrl, playUrl: "http://127.0.0.1:0", negative: true,
       apiKey: null, apiKeyFile: null };
-    await runArc(stubOpts, SELFTEST_SECRET, expect);
+    const stubArc = await runArc(stubOpts, SELFTEST_SECRET, expect);
+    if (!stubArc.fatal) await runGrades(stubOpts, SELFTEST_SECRET, expect, stubArc);
     await runNegative(stubOpts, SELFTEST_SECRET, expect);
     server.close();
 
@@ -1160,6 +1245,9 @@ async function main() {
     "Both sides must land together.");
 
   const arc = await runArc(opts, secret, expect);
+  let grades = {};
+  if (arc.fatal) record(FAIL, "getClassGrades returns 2xx", "the arc failed before grades could be read");
+  else grades = await runGrades(opts, secret, expect, arc);
   const neg = opts.negative ? await runNegative(opts, secret, expect) : {};
 
   // ── summary ─────────────────────────────────────────────────────────────────────────
@@ -1187,6 +1275,9 @@ async function main() {
   if (arc.gameCode) {
     console.log(`  games/${arc.gameCode}                       status=ended`);
     console.log(`    + players/*, teams/*, classroomPlayers/*  (instanceId ${arc.instanceId})`);
+  }
+  if (grades.orphanCode) {
+    console.log(`  games/${grades.orphanCode}                       status=ended  (grades probe: an UNLISTED session under the same instance id)`);
   }
   for (const c of neg.probeCodes ?? []) {
     console.log(`  games/${c}                       status=ended  (negative-suite probe)`);

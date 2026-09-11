@@ -108,8 +108,9 @@ export interface GuestResults {
 
 /**
  * Read one handed-off guest session's per-team + per-player COSTS (Beer Game: getClassResults).
- * Read-only — does NOT end the session or push grades. scoreAndRecord pools these across every
- * team in the instance to compute the cross-team z-score. Idempotent and safe to call repeatedly.
+ * Read-only — does NOT end the session or push grades. Since guest-owned grading (addendum G1)
+ * scoreAndRecord uses it ONLY for the dashboard's Outcome column (raw_score = individual cost);
+ * the grade itself comes from getGuestGrades. Idempotent and safe to call repeatedly.
  */
 export async function getGuestResults(gameCode: string): Promise<GuestResults> {
   const url =
@@ -181,6 +182,86 @@ function parseGuestResults(gameCode: string, out: unknown): GuestResults {
     teams: o["teams"] as GuestResults["teams"],
     players: o["players"] as GuestResultPlayer[],
   };
+}
+
+// ── GUEST-OWNED GRADING (Guest_Owned_Grading_Spec_Addendum_v1.md G1, G2, G5) ─────────────
+
+/** One grade row as the guest returns it from getClassGrades. */
+export interface GuestGradeRow {
+  studentId: string;
+  /** The grade, pushed AS GIVEN into the gradebook's normalized_score. null = no grade. */
+  value: number | null;
+  /** What the number is ("Team cost z-score …", "participation", …). */
+  label: string;
+}
+
+/** A getClassGrades reply without the contract's shape — or not for the students the matcher sent. */
+export class MalformedGuestGradesError extends Error {}
+
+/**
+ * G5 — "The matcher validates shape, never sensibility." One row per student it sent, a finite
+ * number (or null: that student has no grade), a label. Returns null when the reply is
+ * acceptable, otherwise one sentence naming what is wrong.
+ *
+ * ⚠ It does NOT check that the values mean anything. A guest that grades everyone backwards
+ * produces a gradebook full of backwards grades and nothing here objects — the accepted price
+ * of G1, which puts the burden on the conformance harness and whoever reads the gradebook first.
+ */
+export function verifyGuestGrades(out: unknown, instanceId: string, sentStudentIds: string[]): string | null {
+  if (!out || typeof out !== "object") return "the reply is not a JSON object";
+  const o = out as Record<string, unknown>;
+  if (o["ok"] !== true) return `ok is ${JSON.stringify(o["ok"])}, not true`;
+  if (o["instanceId"] !== instanceId) return `it answers for instance ${JSON.stringify(o["instanceId"])}`;
+  if (!Array.isArray(o["grades"])) return "grades is not an array";
+  const sent = new Set(sentStudentIds);
+  const seen = new Set<string>();
+  for (const [i, g] of (o["grades"] as unknown[]).entries()) {
+    const r = (g ?? {}) as Record<string, unknown>;
+    const sid = r["studentId"];
+    if (typeof sid !== "string" || !sid) return `grades[${i}].studentId is missing`;
+    if (!sent.has(sid)) return `grades[${i}] is for ${sid}, a student the matcher never sent`;
+    if (seen.has(sid)) return `${sid} is graded twice`;
+    seen.add(sid);
+    const v = r["value"];
+    if (!(v === null || (typeof v === "number" && Number.isFinite(v)))) {
+      return `grades[${i}].value for ${sid} is ${JSON.stringify(v)}, not a finite number or null`;
+    }
+    if (typeof r["label"] !== "string" || !(r["label"] as string).trim()) return `grades[${i}].label for ${sid} is missing`;
+  }
+  const missing = sentStudentIds.filter((sid) => !seen.has(sid));
+  if (missing.length) return `${missing.length} student(s) the matcher sent got no grade row: ${missing.join(", ")}`;
+  return null;
+}
+
+/**
+ * Ask the guest for the whole instance's grades — ONCE (Beer Game: getClassGrades). Lists the
+ * sessions the matcher recorded, in its group-id order: the guest grades exactly those, which is
+ * how orphan sessions from refused hand-offs are excluded (addendum §6 Q7). Throws on an HTTP
+ * failure (unreachable) and MalformedGuestGradesError on a wrong-shaped reply.
+ */
+export async function getGuestGrades(
+  instanceId: string,
+  gameCodes: string[],
+  sentStudentIds: string[],
+): Promise<GuestGradeRow[]> {
+  const url =
+    process.env.FUNCTIONS_EMULATOR === "true" && process.env.GRADES_URL_OVERRIDE
+      ? process.env.GRADES_URL_OVERRIDE
+      : ACTIVE_TENANT.handoff.gradesUrl;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${guestSecret()}` },
+    body: JSON.stringify({ contract_version: CONTRACT_VERSION, instanceId, gameCodes }),
+  });
+  if (!(res.status >= 200 && res.status < 300)) {
+    throw new Error(`grades failed for instance ${instanceId}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+  }
+  const out = await res.json().catch(() => null);
+  if (out === null) throw new MalformedGuestGradesError(`getClassGrades for ${instanceId} is malformed: the reply is not JSON`);
+  assertGuestVersion("getGuestGrades", out);
+  const problem = verifyGuestGrades(out, instanceId, sentStudentIds);
+  if (problem) throw new MalformedGuestGradesError(`getClassGrades for ${instanceId} is malformed: ${problem}`);
+  return (out as { grades: GuestGradeRow[] }).grades;
 }
 
 /**

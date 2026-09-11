@@ -12,7 +12,6 @@
 // short groups. So the matcher needs NO per-role machinery — just a group size + bots.
 
 import type { ConfigFieldDef } from "@mygames/game-server";
-import type { ScoreDirection } from "./scoring";
 
 export interface MatchingTenant {
   /** Registry game_id — what the classroom launches, carried in the launch JWT. */
@@ -26,18 +25,9 @@ export interface MatchingTenant {
   groupSize: number;
 
   /**
-   * D11 — "Score direction is tenant configuration, not code." Which way the guest's team
-   * outcome (the results' teamCost) points. scoreAndRecord z-scores it across every group;
-   * this decides whether a LOWER number is the better team (the Beer Game's total cost) or
-   * a HIGHER one (a points game). ⚠ Required, with no default: guessing wrong grades a whole
-   * class backwards with nothing on any screen to indicate it, so every tenant must say.
-   */
-  scoreDirection: ScoreDirection;
-
-  /**
    * Whether this guest receives students' DISPLAY NAMES at hand-off (provision members carry
-   * `displayName`). Declared per tenant, with the reason written beside the value — the same
-   * shape as scoreDirection, because the right answer differs per guest: a game where
+   * `displayName`). Declared per tenant, with the reason written beside the value, because
+   * the right answer differs per guest: a game where
    * students must find or address each other needs names; one that never shows a player to
    * another should not receive them. ⚠ Required, with no default: only the tenant can say.
    * (Pass C's D4 withheld names from every guest; reversed 2026-09-10.)
@@ -62,11 +52,16 @@ export interface MatchingTenant {
     /**
      * Guest game "read per-team + per-player costs" endpoint (Beer Game: getClassResults).
      * The matcher POSTs { gameCode } with the provisioning secret and gets back each team's
-     * total cost and each human player's individual cost. The matcher pools these across ALL
-     * of an instance's teams (which live in separate guest games) to compute a cross-team
-     * z-score and push the gradebook — because no single guest game can see the other teams.
+     * total cost and each human player's individual cost. Since guest-owned grading it feeds
+     * ONLY the dashboard's Outcome column (raw_score = individual cost) — not the grade.
      */
     resultsUrl: string;
+    /**
+     * Guest game "grade the whole class" endpoint (Beer Game: getClassGrades) — addendum G2.
+     * Keyed on the INSTANCE: the matcher POSTs { instanceId, gameCodes } once per grading run
+     * and pushes the rows AS GIVEN (G1). The guest owns the grade; the matcher computes nothing.
+     */
+    gradesUrl: string;
     /** Name of the secret (in the matcher's project) holding the shared provisioning secret. */
     secretName: string;
     /**
@@ -95,8 +90,6 @@ export const BEERGAME_TENANT: MatchingTenant = {
   gameId: "beergame",
   title: "The Beer Game",
   groupSize: 4,
-  // The Beer Game's team outcome is TOTAL SUPPLY-CHAIN COST: the cheaper team played better.
-  scoreDirection: "lower_is_better",
   // YES. Names were put on the Beer Game's screens deliberately, because ids were worse:
   // teammates see each other's names on the role cards, the player screen greets the student
   // by name, and the instructor's lobby, report and CSV list players by name. Without names
@@ -117,6 +110,8 @@ export const BEERGAME_TENANT: MatchingTenant = {
       "https://us-central1-beergame-mygames-live.cloudfunctions.net/finalizeClassSession",
     resultsUrl:
       "https://us-central1-beergame-mygames-live.cloudfunctions.net/getClassResults",
+    gradesUrl:
+      "https://us-central1-beergame-mygames-live.cloudfunctions.net/getClassGrades",
     secretName: "PROVISION_SECRET_BEERGAME",
     playUrl: "https://beergame-mygames-live.web.app",
   },

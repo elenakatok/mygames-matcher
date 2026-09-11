@@ -46,6 +46,10 @@
 //                          costByRole is present but not an object
 //   fails-matcher-validation  results the matcher's grading refuses: no players[].teamName
 //                          and a string teamCost — which the harness used to pass
+//   ── guest-owned grading (addendum G1/G2) ──
+//   malformed-grade-row    getClassGrades returns a non-finite value and no label
+//   grades-include-unlisted  getClassGrades grades every session carrying the instance id,
+//                          a refused hand-off's orphan included (§6 Q7)
 //
 // That lying-v1 case is the whole point of version-keying the expectations: under a
 // hardcoded baseline a 500 was "known-current" forever and nobody had to notice. Under v1
@@ -208,7 +212,8 @@ function makeServer(variant) {
             ...(beerShaped ? { teamId, botRoles: ROLES.slice(placed.length) } : {}),
           });
         });
-        sessions.set(code, { seats, ended: false });
+        sessions.set(code, { seats, ended: false,
+          instanceId: typeof parsed?.instanceId === "string" ? parsed.instanceId : null });
 
         return send(200, body({
           gameCode: code,
@@ -218,6 +223,31 @@ function makeServer(variant) {
           // production finding of 2026-09-09.
           ...(declaresSeats && variant !== "silent-botfill" ? { groups: reports } : {}),
         }));
+      }
+
+      // getClassGrades — keyed on the instance; grades exactly the listed sessions (G1/G2).
+      if (url.endsWith("/getClassGrades")) {
+        const instanceId = typeof parsed?.instanceId === "string" ? parsed.instanceId.trim() : "";
+        if (!instanceId) return sendErr(400, "INSTANCE_ID_REQUIRED", "instanceId is required.");
+        const listed = Array.isArray(parsed?.gameCodes) ? parsed.gameCodes.map((c) => String(c).trim().toUpperCase()) : [];
+        if (listed.length === 0) return sendErr(400, "GAME_CODES_REQUIRED", "gameCodes[] is required.");
+        for (const c of listed) {
+          const s = sessions.get(c);
+          if (!s) return sendErr(404, "NOT_FOUND", `No session ${c}.`);
+          if (s.instanceId !== instanceId) return sendErr(409, "SESSION_NOT_IN_INSTANCE", `${c} is not in ${instanceId}.`);
+        }
+        // Correct: grade exactly the listed sessions. DEFECT (grades-include-unlisted): grade every
+        // session carrying the instance id — a refused hand-off's orphan included.
+        const codes = variant === "grades-include-unlisted"
+          ? [...sessions.entries()].filter(([, s]) => s.instanceId === instanceId).map(([c]) => c)
+          : listed;
+        const rows = codes.flatMap((c) => sessions.get(c).seats.map((seat) => ({
+          studentId: seat.studentId, value: 0, label: "Selftest team-cost z-score" })));
+        // DEFECT (malformed-grade-row): a non-finite value and no label on the first row.
+        const grades = variant === "malformed-grade-row"
+          ? rows.map((r, i) => (i === 0 ? { studentId: r.studentId, value: "0" } : r))
+          : rows;
+        return send(200, body({ ok: true, instanceId, grades }));
       }
 
       if (url.endsWith("/finalizeClassSession") || url.endsWith("/getClassResults")) {
@@ -490,6 +520,22 @@ export const SELFTEST_SCENARIOS = [
     what: "results the matcher's grading refuses (no players[].teamName, a string teamCost)",
     expectedFailures: [
       "results pass the matcher's grading validation (D10)",
+    ],
+  },
+  // ── guest-owned grading (addendum G1/G2) ─────────────────────────────────────────
+  {
+    variant: "malformed-grade-row",
+    what: "getClassGrades returns a grade row with a non-finite value and no label",
+    expectedFailures: [
+      "grade rows pass the matcher's grade validation (G5)",
+    ],
+  },
+  {
+    variant: "grades-include-unlisted",
+    what: "getClassGrades grades every session carrying the instance id — a refused hand-off's orphan too",
+    expectedFailures: [
+      "sessions not listed are excluded (a refused hand-off's orphan)",
+      "grade rows pass the matcher's grade validation (G5)",
     ],
   },
 ];
